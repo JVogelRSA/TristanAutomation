@@ -1,0 +1,4 @@
+imap-tools
+pandas
+openai
+python-dotenv

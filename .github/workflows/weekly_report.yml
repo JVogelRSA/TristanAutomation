@@ -1,0 +1,39 @@
+name: Weekly Inventory Report
+
+on:
+  schedule:
+    # Runs at 10:00 AM UTC every Monday
+    - cron: '0 10 * * 1'
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Run Inventory Bot
+      env:
+        IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
+        IMAP_USERNAME: ${{ secrets.IMAP_USERNAME }}
+        IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        EMAIL_SUBJECT_KEYWORD: ${{ secrets.EMAIL_SUBJECT_KEYWORD }}
+      run: python inventory_bot.py
