@@ -74,13 +74,6 @@ def generate_llm_report(prev_df, curr_df):
     """
     print("Generating report with LLM...")
     
-    # Create text summaries to save tokens
-    # We'll summarize by listing items with changes or low stock
-    # This is a naive implementation; for large CSVs, we'd need better summarization
-    
-    # Identify key columns (assuming standard names, might need adjustment)
-    # Let's try to interpret the columns or just dump the first few rows
-    
     summary_text = f"""
     Here is the inventory data for the last two weeks.
     
@@ -105,6 +98,8 @@ def generate_llm_report(prev_df, curr_df):
     2. Highlight any low stock items that need reordering.
     3. Point out any stagnant items (no change).
     
+    **Format the output as HTML** using <h3> for headers, <ul>/<li> for lists, and <b> for emphasis.
+    Do not include valid HTML boilerplate (html/body tags), just the content.
     Keep it professional, concise, and actionable.
     """
     
@@ -119,18 +114,32 @@ def generate_llm_report(prev_df, curr_df):
         return response.choices[0].message.content
     except Exception as e:
         print(f"Error generating LLM report: {e}")
-        return "Error generating report."
+        return "<p>Error generating report.</p>"
 
-def send_email_report(report_content):
+def send_email_report(report_content, attachments=None):
     """
-    Sends the generated report via Email.
+    Sends the generated report via Email with attachments.
+    attachments: list of tuples (filename, content_bytes)
     """
     print(f"Sending email to {REPORT_RECIPIENT}...")
     
-    msg = MIMEText(report_content)
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.application import MIMEApplication
+
+    msg = MIMEMultipart()
     msg['Subject'] = f"Weekly Inventory Report - {datetime.now().strftime('%Y-%m-%d')}"
     msg['From'] = SMTP_USERNAME
     msg['To'] = REPORT_RECIPIENT
+
+    # Attach the HTML body
+    msg.attach(MIMEText(report_content, 'html'))
+
+    # Attach CSV files
+    if attachments:
+        for filename, content in attachments:
+            part = MIMEApplication(content, Name=filename)
+            part['Content-Disposition'] = f'attachment; filename="{filename}"'
+            msg.attach(part)
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
@@ -148,6 +157,8 @@ def main():
 
     data = fetch_latest_emails(limit=2)
     
+    csv_attachments = []
+    
     if len(data) == 0:
         print("No inventory emails found.")
         return
@@ -156,10 +167,22 @@ def main():
         curr_date, curr_df = data[0]
         # TODO: Handle single week report
         prev_df = curr_df # Hack for now
+        
+        # Prepare attachment
+        csv_buffer = io.BytesIO()
+        curr_df.to_csv(csv_buffer, index=False)
+        csv_attachments.append((f"inventory_{curr_date.strftime('%Y%m%d')}.csv", csv_buffer.getvalue()))
+        
     else:
         print(f"Comparing data from {data[0][0]} and {data[1][0]}")
         prev_date, prev_df = data[0]
         curr_date, curr_df = data[1]
+        
+        # Prepare attachments
+        for date, df in data:
+            csv_buffer = io.BytesIO()
+            df.to_csv(csv_buffer, index=False)
+            csv_attachments.append((f"inventory_{date.strftime('%Y%m%d')}.csv", csv_buffer.getvalue()))
 
     report = generate_llm_report(prev_df, curr_df)
     print("\n--- REPORT PREVIEW ---\n")
@@ -167,7 +190,7 @@ def main():
     print("\n----------------------\n")
     
     if REPORT_RECIPIENT:
-        send_email_report(report)
+        send_email_report(report, attachments=csv_attachments)
     else:
         print("No recipient configured, skipping email send.")
 
