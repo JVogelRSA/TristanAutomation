@@ -87,18 +87,21 @@ def generate_llm_report(prev_df, curr_df):
     client = OpenAI(api_key=OPENAI_API_KEY)
     
     prompt = f"""
-    You are an inventory management expert. 
+    You are an inventory and supply chain expert. 
     Analyze the following two datasets (Previous Week vs Current Week).
     The data represents our warehouse stock.
     
     {summary_text}
     
-    Please write a concise executive summary email for my boss.
-    1. Highlight any significant drops in inventory (sales).
-    2. Highlight any low stock items that need reordering.
-    3. Point out any stagnant items (no change).
+    Please write a professional Executive Summary report for my boss.
+    Include the following sections:
+    1. 📈 **Velocity Analysis**: For each item, compare this week vs last week. How many units were 'burned' (sold)?
+    2. ⏳ **Estimated Stock Runway**: Based on this week's burn rate, how many weeks of stock do we have left for each item?
+    3. 🚨 **Reorder Alerts**: Which items need to be ordered immediately to avoid stockouts?
+    4. 🧊 **Stagnant Stock**: Any items that didn't move at all?
     
     **Format the output as HTML** using <h3> for headers, <ul>/<li> for lists, and <b> for emphasis.
+    Use a <table> for the Item Status if there are many items.
     Do not include valid HTML boilerplate (html/body tags), just the content.
     Keep it professional, concise, and actionable.
     """
