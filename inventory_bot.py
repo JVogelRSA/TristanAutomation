@@ -70,39 +70,68 @@ def fetch_latest_emails(limit=2):
 
 def generate_llm_report(prev_df, curr_df):
     """
-    Sends the data to LLM to generate a comparison report.
+    Analyzes the change between two weeks to calculate 'burn rate' (sales velocity)
+    and estimates stock runway.
     """
-    print("Generating report with LLM...")
+    print("Analyzing data and generating report...")
+    
+    # Attempt to identify the 'Item Name' and 'Quantity' columns
+    # Common DCL headers: 'Item', 'Item Number', 'Description', 'Quantity On Hand', 'Available'
+    item_col = next((c for c in curr_df.columns if 'item' in c.lower() or 'sku' in c.lower()), curr_df.columns[0])
+    qty_col = next((c for c in curr_df.columns if 'hand' in c.lower() or 'qty' in c.lower() or 'available' in c.lower()), curr_df.columns[-1])
+    
+    print(f"Using columns: Item='{item_col}', Qty='{qty_col}'")
+
+    # Merge the two weeks
+    merged = pd.merge(
+        prev_df[[item_col, qty_col]], 
+        curr_df[[item_col, qty_col]], 
+        on=item_col, 
+        suffixes=('_prev', '_curr')
+    )
+
+    # Calculate Weekly Burn (Sales)
+    # Sales = Last Week - This Week (if positive)
+    merged['Weekly_Sales'] = merged[f'{qty_col}_prev'] - merged[f'{qty_col}_curr']
+    merged['Weekly_Sales'] = merged['Weekly_Sales'].apply(lambda x: max(0, x)) # Ignore restocks for burn calculation
+    
+    # Calculate Runway (Weeks Left)
+    # Runway = Current Qty / Weekly Sales
+    def calculate_runway(row):
+        if row['Weekly_Sales'] <= 0:
+            return "N/A (No sales)"
+        runway = row[f'{qty_col}_curr'] / row['Weekly_Sales']
+        return f"{runway:.1f} weeks"
+
+    merged['Runway'] = merged.apply(calculate_runway, axis=1)
+
+    # Prepare data for LLM
+    # We'll send a subset: Item, Current Stock, Sales this week, Runway
+    summary_df = merged[[item_col, f'{qty_col}_curr', 'Weekly_Sales', 'Runway']]
+    summary_df.columns = ['Item', 'Current Stock', 'Sales (This Week)', 'Runway (Est)']
     
     summary_text = f"""
-    Here is the inventory data for the last two weeks.
-    
-    Previous Week Data (Sample):
-    {prev_df.to_string(index=False)}
-    
-    Current Week Data (Sample):
-    {curr_df.to_string(index=False)}
+    Inventory Comparison:
+    {summary_df.to_string(index=False)}
     """
     
     client = OpenAI(api_key=OPENAI_API_KEY)
     
     prompt = f"""
     You are an inventory and supply chain expert. 
-    Analyze the following two datasets (Previous Week vs Current Week).
-    The data represents our warehouse stock.
+    Analyze the following inventory change data (Previous Week vs Current Week).
     
     {summary_text}
     
     Please write a professional Executive Summary report for my boss.
     Include the following sections:
-    1. 📈 **Velocity Analysis**: For each item, compare this week vs last week. How many units were 'burned' (sold)?
-    2. ⏳ **Estimated Stock Runway**: Based on this week's burn rate, how many weeks of stock do we have left for each item?
-    3. 🚨 **Reorder Alerts**: Which items need to be ordered immediately to avoid stockouts?
-    4. 🧊 **Stagnant Stock**: Any items that didn't move at all?
+    1. 📈 **Burn Rate Overview**: Which items are selling fastest?
+    2. ⏳ **Stock Runway**: Highlight items that will run out in less than 4 weeks.
+    3. 🚨 **Reorder Recommendations**: Give specific "Order Now" recommendations for low-runway items.
+    4. 🧊 **Stagnant Items**: Note items with 0 sales this week.
     
-    **Format the output as HTML** using <h3> for headers, <ul>/<li> for lists, and <b> for emphasis.
-    Use a <table> for the Item Status if there are many items.
-    Do not include valid HTML boilerplate (html/body tags), just the content.
+    **Format as HTML**. Use <h3> for headers, <ul>/<li> for lists, and <b> for emphasis.
+    Use a <table> for the Item Summary.
     Keep it professional, concise, and actionable.
     """
     
