@@ -2,3 +2,6 @@ imap-tools
 pandas
 openai
 python-dotenv
+requests
+snowflake-connector-python
+pyarrow
