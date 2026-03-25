@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 # Shared utilities
 from utils.email_sender import send_report_email
 from utils.docx_generator import html_to_docx
+from utils.history import get_week_monday, save_weekly_snapshot, load_history, build_inventory_comparison
 
 # Load environment variables
 load_dotenv()
@@ -92,10 +93,11 @@ def fetch_latest_emails(limit=4):
     inventory_data.sort(key=lambda x: x[0])
     return inventory_data
 
-def generate_llm_report(dfs_data):
+def generate_llm_report(dfs_data, history=None):
     """
     Analyzes historical data across multiple weeks to calculate average 'burn rate'
     and estimates stock runway, applying human-readable SKU Mappings.
+    history: list of past weekly snapshots from utils/history.py
     """
     print("Analyzing comprehensive data and generating report...")
     
@@ -187,10 +189,23 @@ def generate_llm_report(dfs_data):
     date_start = dfs_data[-2][0].strftime('%B %d')
     date_end = dfs_data[-1][0].strftime('%B %d')
     
+    # Build per-SKU dict for historical comparison and snapshot saving
+    current_skus = {}
+    for _, row in active_items.iterrows():
+        current_skus[row['SKU']] = {
+            "product": row['Product'],
+            "stock": float(row['Current Stock']),
+            "burn_rate": float(row['Avg Wkly Burn']),
+        }
+
+    hist_comparison = build_inventory_comparison(history or [], current_skus)
+
     summary_text = f"""
     Report Period: {date_start} to {date_end}
     Multi-Week Inventory Average ({weeks_evaluated} weeks evaluated):
     {active_items.to_string(index=False)}
+
+    {hist_comparison}
     """
     
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -216,6 +231,7 @@ def generate_llm_report(dfs_data):
     <h3>📅 <b>2. System-Wide Burn Rate & Velocity</b></h3>
     *   Identify the top 3 fastest-moving SKUs across the entire dataset this week.
     *   Highlight highly active SKUs with the largest Average Weekly Burn.
+    *   If HISTORICAL TRENDS data is provided, call out SKUs where burn rate is accelerating or decelerating significantly, and any notable stock drops vs prior weeks.
     
     <h3>⏳ <b>3. Critical Stock Runway (Restock Alerts)</b></h3>
     *   **The "4-Week Red Zone"**: List every non-Top-10 item with < 4 weeks of stock left based on current average burn.
@@ -245,10 +261,11 @@ def generate_llm_report(dfs_data):
                 {"role": "user", "content": prompt}
             ]
         )
-        return response.choices[0].message.content, active_items
+        snapshot = {"skus": current_skus}
+        return response.choices[0].message.content, active_items, snapshot
     except Exception as e:
         print(f"Error generating LLM report: {e}")
-        return "<p>Error generating report.</p>", summary_df
+        return "<p>Error generating report.</p>", summary_df, {}
 
 def main():
     if not IMAP_USERNAME or not IMAP_PASSWORD or not OPENAI_API_KEY:
@@ -267,14 +284,21 @@ def main():
 
     print(f"Evaluating data across {len(data)} weeks of history.")
 
-    report_html, summary_df = generate_llm_report(data)
+    # Load historical snapshots and generate report
+    history = load_history("inventory")
+    week_monday = get_week_monday()
+    report_html, summary_df, snapshot = generate_llm_report(data, history=history)
+
+    # Save this week's snapshot for future comparisons
+    if snapshot:
+        save_weekly_snapshot("inventory", week_monday, snapshot)
 
     print("\n--- REPORT PREVIEW ---\n")
     print(report_html)
     print("\n----------------------\n")
 
     # Build attachments
-    date_str = datetime.now().strftime('%Y-%m-%d')
+    date_str = week_monday.isoformat()
 
     # Generate DOCX report
     docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str)

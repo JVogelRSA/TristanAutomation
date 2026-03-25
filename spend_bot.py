@@ -13,6 +13,7 @@ from adapters.rippling import fetch_rippling_expenses
 # Shared utilities
 from utils.email_sender import send_report_email
 from utils.docx_generator import html_to_docx
+from utils.history import get_week_monday, save_weekly_snapshot, load_history, build_spend_comparison
 
 # Load environment variables
 load_dotenv()
@@ -28,20 +29,19 @@ RIPPLING_API_KEY = os.getenv("RIPPLING_API_KEY")
 def format_currency(x):
     return "${:,.2f}".format(x)
 
-def generate_spend_report(df):
+def generate_spend_report(df, history=None):
     """
     Uses LLM to analyze the unified spend dataframe for Week-over-Week insights.
+    history: list of past weekly snapshots from utils/history.py
     """
     print("Generating Spend Analysis with LLM...")
-    
+
     # Needs Date column as datetime
     df['Date'] = pd.to_datetime(df['Date'])
-    
+
     # Snap to the most recent Monday to ensure consistent Monday-to-Monday reporting
-    now = datetime.now()
-    days_since_monday = now.weekday() # Monday = 0, Sunday = 6
-    most_recent_monday = (now - timedelta(days=days_since_monday)).date()
-    
+    most_recent_monday = get_week_monday()
+
     end_date = pd.to_datetime(most_recent_monday)
     curr_week_start = end_date - timedelta(days=7)
     prev_week_start = end_date - timedelta(days=14)
@@ -60,16 +60,21 @@ def generate_spend_report(df):
     
     top_vendors = curr_df.groupby('Description')['Amount'].sum().sort_values(ascending=False).head(10)
     
+    # Build historical comparison if we have past data
+    hist_comparison = build_spend_comparison(history or [], curr_total, most_recent_monday)
+
     summary_text = f"""
     --- SPEND DATA ({curr_week_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}) ---
     Total Spend: {format_currency(curr_total)}
     Trend: {trend}
-    
+
     Top 10 Vendors (This Period):
     {top_vendors.to_string()}
-    
+
     Detailed Transaction List (Top 50 by size):
     {curr_df.sort_values(by='Amount', ascending=False).head(50).to_string(index=False)}
+
+    {hist_comparison}
     """
     
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -91,6 +96,7 @@ def generate_spend_report(df):
     <h3>💰 <b>1. Executive Spend Snapshot (via Brex)</b></h3>
     *   Total Spend this week.
     *   Week-over-Week Trend (Compare this week to last week based on provided stats).
+    *   If HISTORICAL COMPARISON data is provided, include: comparison vs rolling average and vs same week last month.
     *   Largest single transaction of the week.
     *   Add a bold, 1-sentence CFO insight summarizing the week's spend health.
     
@@ -132,10 +138,19 @@ def generate_spend_report(df):
             ]
         )
         report_html = response.content[0].text
-        return report_html, curr_df
+
+        # Build snapshot data for persistence
+        snapshot = {
+            "total_spend": round(curr_total, 2),
+            "prev_week_spend": round(prev_total, 2),
+            "transaction_count": len(curr_df),
+            "top_vendors": {k: round(v, 2) for k, v in top_vendors.head(5).items()},
+            "by_source": {k: round(v, 2) for k, v in curr_df.groupby('Source')['Amount'].sum().items()} if 'Source' in curr_df.columns else {},
+        }
+        return report_html, curr_df, snapshot
     except Exception as e:
         print(f"Error generating LLM report: {e}")
-        return "<p>Error generating report.</p>", curr_df
+        return "<p>Error generating report.</p>", curr_df, {}
 
 def main():
     print("Starting Spend Analysis Bot...")
@@ -163,11 +178,17 @@ def main():
         print("No data fetched from any source. Check API keys.")
         return
 
-    # 3. Analyze
-    report_html, curr_df = generate_spend_report(unified_df)
+    # 3. Load historical data and analyze
+    history = load_history("spend")
+    week_monday = get_week_monday()
+    report_html, curr_df, snapshot = generate_spend_report(unified_df, history=history)
+
+    # Save this week's snapshot for future comparisons
+    if snapshot:
+        save_weekly_snapshot("spend", week_monday, snapshot)
 
     # 4. Build attachments
-    date_str = datetime.now().strftime('%Y-%m-%d')
+    date_str = week_monday.isoformat()
 
     # Generate DOCX report
     docx_bytes = html_to_docx(report_html, "Weekly Spend Analysis (Brex)", date_str)
