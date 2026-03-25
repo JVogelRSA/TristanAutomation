@@ -1,7 +1,10 @@
 imap-tools
 pandas
 openai
+anthropic
 python-dotenv
 requests
 snowflake-connector-python
 pyarrow
+python-docx
+htmldocx

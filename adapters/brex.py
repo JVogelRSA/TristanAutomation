@@ -73,11 +73,13 @@ def fetch_brex_transactions(api_key, days_back=30):
         if txn.get('merchant'):
             category = txn.get('merchant').get('mcc_description') or category
             
-        # Filter for only Money Out (positive amount in Brex is usually spend, but verify)
-        # Brex: positive = spend, negative = refund/payment
         try:
-            amt_val = float(amount)
-        except:
+            raw_amt = float(amount)
+            # In Brex, spend is POSITIVE, payments are NEGATIVE
+            if raw_amt <= 0:
+                continue # Skip payments/credits
+            amt_val = raw_amt / 100.0
+        except ValueError:
             amt_val = 0.0
             
         normalized_data.append({
