@@ -15,8 +15,8 @@ from utils.email_sender import send_report_email
 from utils.docx_generator import html_to_docx
 from utils.history import get_week_monday, save_weekly_snapshot, load_history, build_spend_comparison
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from the .env file next to this script
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # Configuration
 REPORT_RECIPIENT = os.getenv("REPORT_RECIPIENT")
