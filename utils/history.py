@@ -6,6 +6,89 @@ from pathlib import Path
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 
+def get_month_key():
+    """Returns 'YYYY-MM' string for the current calendar month."""
+    return datetime.now().strftime('%Y-%m')
+
+
+def save_monthly_snapshot(bot_name, month_key, data):
+    """
+    Save a monthly snapshot as JSON.
+    month_key: 'YYYY-MM' string (e.g. '2026-03')
+    data: dict of metrics to persist
+    """
+    path = DATA_DIR / bot_name
+    path.mkdir(parents=True, exist_ok=True)
+    filepath = path / f"month_{month_key}.json"
+    payload = {"month": month_key, "saved_at": datetime.now().isoformat(), **data}
+    with open(filepath, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print(f"Saved monthly snapshot: {filepath.name}")
+
+
+def load_monthly_history(bot_name, max_months=12):
+    """
+    Load all saved monthly snapshots, sorted oldest-first.
+    Returns list of dicts. Caps at max_months most recent.
+    """
+    bot_path = DATA_DIR / bot_name
+    bot_path.mkdir(parents=True, exist_ok=True)
+    files = sorted(bot_path.glob("month_*.json"))
+    snapshots = []
+    for f in files:
+        try:
+            with open(f) as fh:
+                snapshots.append(json.load(fh))
+        except (json.JSONDecodeError, IOError):
+            continue
+    return snapshots[-max_months:]
+
+
+def build_monthly_spend_comparison(history, curr_total):
+    """Build a historical comparison string for the monthly spend LLM prompt."""
+    if not history:
+        return ""
+    lines = []
+    recent = [h for h in history[-3:] if "total_spend" in h]
+    if recent:
+        avg = sum(h["total_spend"] for h in recent) / len(recent)
+        pct = ((curr_total - avg) / avg * 100) if avg > 0 else 0
+        lines.append(f"3-Month Average Spend: ${avg:,.2f} (this month is {pct:+.1f}% vs avg)")
+    if len(recent) >= 2:
+        direction = "increasing" if recent[-1]["total_spend"] < curr_total else "decreasing"
+        lines.append(f"Spend trend over last {len(recent)+1} months: {direction}")
+        for h in recent:
+            lines.append(f"  {h['month']}: ${h['total_spend']:,.2f} ({h.get('transaction_count', '?')} txns)")
+    if not lines:
+        return ""
+    return "--- MONTHLY HISTORICAL COMPARISON ---\n" + "\n".join(lines)
+
+
+def build_monthly_inventory_comparison(history, current_skus):
+    """Build historical comparison for the monthly inventory LLM prompt."""
+    if not history:
+        return ""
+    lines = []
+    if history:
+        prev = history[-1]
+        changes = []
+        for sku, curr in current_skus.items():
+            prev_sku = prev.get("skus", {}).get(sku)
+            if prev_sku and "monthly_burn" in prev_sku and curr.get("monthly_burn", 0) > 0:
+                prev_burn = prev_sku["monthly_burn"]
+                curr_burn = curr["monthly_burn"]
+                if prev_burn > 0:
+                    pct = ((curr_burn - prev_burn) / prev_burn) * 100
+                    if abs(pct) > 10:
+                        direction = "up" if pct > 0 else "down"
+                        changes.append(f"{curr.get('product', sku)}: {direction} {abs(pct):.0f}% MoM ({prev_burn:.1f} → {curr_burn:.1f} units/mo)")
+        if changes:
+            lines.append(f"Month-over-Month Burn Changes (vs {prev.get('month', '?')}):\n  " + "\n  ".join(changes[:6]))
+    if not lines:
+        return ""
+    return "--- MONTH-OVER-MONTH TRENDS ---\n" + "\n".join(lines)
+
+
 def get_week_monday():
     """Returns the most recent Monday as a date object. Consistent across all bots."""
     today = datetime.now().date()

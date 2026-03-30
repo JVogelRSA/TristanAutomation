@@ -16,7 +16,7 @@ from utils.docx_generator import html_to_docx
 from utils.history import get_week_monday, save_weekly_snapshot, load_history, build_spend_comparison
 
 # Load environment variables from the .env file next to this script
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 
 # Configuration
 REPORT_RECIPIENT = os.getenv("REPORT_RECIPIENT")
@@ -80,52 +80,59 @@ def generate_spend_report(df, history=None):
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     
     prompt = f"""
-    Analyze the following weekly spend data for our hardware/tech company.
-    
-    DATA SUMMARY:
-    {summary_text}
-    
-    --------------------------------------------------
-    
-    Create a **Comprehensive Weekly Financial Report** for the CEO. 
-    *CRITICAL*: Most transactions are labeled "Uncategorized". You MUST use the Vendor name to infer standard logical business Categories (e.g., Marketing, COGS, Software & Tech, Office Supplies, Travel & Entertainment).
-    *CRITICAL*: DO NOT include any conversational filler (e.g. "Here is the report", "This report provides..."). Output ONLY the requested HTML structure.
-    
-    **REQUIRED REPORT STRUCTURE:**
-    
-    <h3>💰 <b>1. Executive Spend Snapshot (via Brex)</b></h3>
-    *   Total Spend this week.
-    *   Week-over-Week Trend (Compare this week to last week based on provided stats).
-    *   If HISTORICAL COMPARISON data is provided, include: comparison vs rolling average and vs same week last month.
-    *   Largest single transaction of the week.
-    *   Add a bold, 1-sentence CFO insight summarizing the week's spend health.
-    
-    <h3>📊 <b>2. Category Breakdown</b></h3>
-    *   Provide a clean HTML table summarizing the total spend grouped by your inferred categories.
-    *   Sort the table from highest total spend to lowest.
-    *   Ensure all transaction spend is accounted for in these buckets.
-    
-    <h3>🔍 <b>3. Vendor Deep Dive (Top 10)</b></h3>
-    *   List the Top 10 Vendors by total spend.
-    *   For each, list the number of transactions, average transaction size, and your inferred Category.
-    
-    <h3>🚨 <b>4. Anomaly Detection & Review</b></h3>
-    *   Identify any transactions > $1,000.
-    *   Flag any highly unusual spend or apparent duplicate transactions.
-    
-    <h3>💡 <b>5. Cost Savings & Optimization Opportunities</b></h3>
-    *   As a Fractional CFO, identify 1-2 actionable operational improvements, potential subscription consolidations, or areas of spend that look inefficient based on this week's vendor patterns.
-    
-    <h3>🧾 <b>6. Transaction Log</b></h3>
-    *   Provide a table of the top 20 largest transactions (Date, Vendor, Amount, inferred Category).
-    
-    **Format Requirements:**
-    *   Use professional HTML formatting with clean spacing.
-    *   Start immediately with the <h3> tags. NO intro text. NO outro text.
-    *   Use <table> for data presentation.
+You are an elite Fractional CFO for a hardware/tech company. Analyse the weekly spend data below and produce a Comprehensive Weekly Financial Report for the CEO.
 
-    **Length Constraint:** The final report MUST fit on 1-2 printed pages. Be thorough but concise — use compact tables, short bullet points, and avoid verbose prose.
-    """
+DATA SUMMARY:
+{summary_text}
+
+--------------------------------------------------
+
+Output ONLY valid HTML — no markdown, no code fences, no ** bold syntax (use <b> tags), no introductory or closing text.
+Start directly with the first <h3> tag.
+
+Most transactions are labelled "Uncategorized" — you MUST infer logical business categories from vendor names
+(e.g. Marketing, COGS / Inventory, Software & Subscriptions, Payroll & Benefits, Travel & Entertainment, Office & Facilities, Professional Services, Shipping & Logistics).
+
+REQUIRED SECTIONS:
+
+<h3>1. Executive Spend Snapshot</h3>
+Present the following as a compact 2-column summary table (Metric | Value):
+  - Total spend this week
+  - Week-over-Week change (amount + %)
+  - Rolling 4-week average (if historical data available)
+  - Largest single transaction
+  - Number of transactions
+Then add a single <p><b>CFO Insight:</b> …</p> — one bold sentence assessing spend health and flagging the most important issue or opportunity.
+
+<h3>2. Spend by Category</h3>
+HTML table: Category | Total Spend | % of Week | Txn Count.
+Sort highest to lowest. Apply inline style background-color:#FFE0DC on any category that is unexpectedly high or anomalous.
+Every dollar of spend must appear in exactly one category. End with a "Total" footer row.
+
+<h3>3. Top 10 Vendors</h3>
+HTML table: Vendor | Category | Total Spend | Txn Count | Avg Txn Size.
+Sorted by Total Spend descending. Bold the vendor name in each row.
+
+<h3>4. Anomalies & Items for Review</h3>
+List every transaction over $1,000 in a table: Date | Vendor | Amount | Category | Note.
+Also flag any apparent duplicates (same vendor + same amount within the week) or unusual spend spikes.
+If nothing warrants flagging, write "No anomalies detected this week."
+
+<h3>5. Cost Savings & Optimisation</h3>
+2–3 specific, actionable bullet points based on actual vendor patterns in this data.
+Name the vendor or category. Quantify the opportunity where possible. No generic advice.
+
+<h3>6. Full Transaction Log (Top 20 by Amount)</h3>
+HTML table: Date | Vendor | Amount | Category.
+Apply inline style background-color:#FFF3CC on rows with Amount >= $1,000.
+
+FORMAT RULES:
+- Valid HTML only. No markdown. Use <b> not **bold**.
+- Tables must have <thead><tr><th> headers.
+- Currency formatted as $X,XXX.XX throughout.
+- Keep every section concise — this report must be scannable in under 3 minutes.
+- Do NOT start with any greeting or intro. Do NOT end with a sign-off.
+"""
     
     try:
         response = client.messages.create(

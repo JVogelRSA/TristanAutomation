@@ -2,6 +2,9 @@ import os
 import io
 from datetime import datetime
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from imap_tools import MailBox, AND
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -50,6 +53,73 @@ TOP_PRIORITY_SKUS = ['1', '401', '400', '28', '29', '31', '36', '37']
 EXCLUDED_SKUS = [
     '3-36', '3-37', '34-', '34-1', '35-', '36-', '37-', '4-3-1', '7'
 ]
+
+def generate_runway_chart(summary_df: pd.DataFrame) -> bytes | None:
+    """
+    Render a horizontal bar chart of stock runway by product.
+    Colour-coded: red < 4 wks, orange 4–8 wks, green > 8 wks.
+    Returns PNG bytes, or None if there is nothing to chart.
+    """
+    def parse_runway(s):
+        try:
+            return float(str(s).replace(' weeks', '').strip())
+        except (ValueError, TypeError):
+            return None
+
+    df = summary_df[summary_df['Avg Wkly Burn'] > 0].copy()
+    df['Runway_Float'] = df['Runway (Est)'].apply(parse_runway)
+    df = df.dropna(subset=['Runway_Float']).sort_values('Runway_Float')
+
+    if df.empty:
+        return None
+
+    DISPLAY_CAP = 30
+    df['Runway_Display'] = df['Runway_Float'].clip(upper=DISPLAY_CAP)
+
+    colours = [
+        '#C0392B' if r < 4 else '#E67E22' if r < 8 else '#27AE60'
+        for r in df['Runway_Float']
+    ]
+
+    fig_height = max(3.0, len(df) * 0.48)
+    fig, ax = plt.subplots(figsize=(8, fig_height))
+    fig.patch.set_facecolor('#FAFAFA')
+    ax.set_facecolor('#FAFAFA')
+
+    bars = ax.barh(
+        df['Product'], df['Runway_Display'],
+        color=colours, edgecolor='white', height=0.58
+    )
+
+    for bar, val in zip(bars, df['Runway_Float']):
+        label = f"{val:.1f} wks" if val <= DISPLAY_CAP else f"{val:.0f}+ wks"
+        ax.text(
+            bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
+            label, va='center', ha='left', fontsize=8.5, color='#333333'
+        )
+
+    ax.axvline(4,  color='#C0392B', linestyle='--', linewidth=1.1, alpha=0.75, label='4-week Critical Zone')
+    ax.axvline(8,  color='#E67E22', linestyle='--', linewidth=1.1, alpha=0.75, label='8-week Caution Zone')
+
+    ax.set_xlabel('Estimated Stock Runway (weeks)', fontsize=9, color='#444')
+    ax.set_title('Stock Runway by Product', fontsize=12, fontweight='bold',
+                 color='#1E3A5F', pad=12)
+    ax.legend(fontsize=8, loc='lower right', framealpha=0.7)
+    ax.set_xlim(0, max(DISPLAY_CAP + 2, df['Runway_Display'].max() + 3))
+    for spine in ('top', 'right'):
+        ax.spines[spine].set_visible(False)
+    ax.spines['left'].set_color('#CCCCCC')
+    ax.spines['bottom'].set_color('#CCCCCC')
+    ax.tick_params(axis='both', labelsize=8.5, colors='#444')
+    ax.xaxis.grid(True, linestyle=':', linewidth=0.6, alpha=0.6)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout(pad=1.2)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
+    plt.close(fig)
+    return buf.getvalue()
+
 
 def fetch_latest_emails(limit=4):
     """
@@ -209,49 +279,55 @@ def generate_llm_report(dfs_data, history=None):
     """
     
     client = OpenAI(api_key=OPENAI_API_KEY)
-    
-    prompt = f"""
-    You are a Senior Supply Chain Analyst at a high-growth hardware company. 
-    Analyze the following inventory data. The "Avg Wkly Burn" represents the calculated average units sold per week over the last month.
-    
-    DATA SUMMARY:
-    {summary_text}
-    
-    --------------------------------------------------
-    
-    Create a **Detailed Weekly Inventory Deep Dive** for the Executive Team.
-    
-    **REQUIRED REPORT STRUCTURE:**
-    
-    <h3>🌟 <b>1. Top Priority Items Snapshot ({date_start} - {date_end})</b></h3>
-    *   Filter for items where "Top 10" is "Yes".
-    *   Highlight their Current Stock, Avg Weekly Burn, and Estimated Runway.
-    *   **CRITICAL ALERTS**: For any Top 10 item where Runway is < 6 weeks, prominently issue a warning stating exactly when it will sell out and that reordering must happen immediately.
-    
-    <h3>📅 <b>2. System-Wide Burn Rate & Velocity</b></h3>
-    *   Identify the top 3 fastest-moving SKUs across the entire dataset this week.
-    *   Highlight highly active SKUs with the largest Average Weekly Burn.
-    *   If HISTORICAL TRENDS data is provided, call out SKUs where burn rate is accelerating or decelerating significantly, and any notable stock drops vs prior weeks.
-    
-    <h3>⏳ <b>3. Critical Stock Runway (Restock Alerts)</b></h3>
-    *   **The "4-Week Red Zone"**: List every non-Top-10 item with < 4 weeks of stock left based on current average burn.
-    *   **The "6-Week Yellow Zone"**: List items with 4-6 weeks of stock. Advise preparing POs.
-    
-    <h3>📋 <b>4. All Tracked Items Data Table</b></h3>
-    *   Create a clean HTML table showing ALL items passed to you with their Product Name, SKU, Current Stock, Avg Wkly Burn, and Estimated Runway.
-    *   Ensure this table is strictly ordered from Highest Avg Wkly Burn to Lowest.
-    
-    <p><i><b>Methodology Note:</b></i></p>
-    *   Add a brief 1-2 sentence explanation at the very bottom stating that the "Avg Weekly Burn" is calculated based on a moving average of actual stock depletion over the last {weeks_evaluated} weeks to ensure accurate trends.
-    
-    **Format Requirements:**
-    *   Use professional HTML formatting. DO NOT include conversational filler like "Here is your report."
-    *   Start immediately with the <h3> tags.
-    *   Use <table> for lists of data.
-    *   Use 🔴 (Red Circle) for critical restock alerts and 🟢 (Green Circle) for safe status.
 
-    **Length Constraint:** Keep the entire report to 1-2 printed pages maximum. Be data-dense and concise — use compact tables and short bullet points.
-    """
+    prompt = f"""
+You are a Senior Supply Chain Analyst at a high-growth hardware company.
+Analyze the inventory data below. "Avg Wkly Burn" = average units sold per week over the past month.
+
+DATA SUMMARY:
+{summary_text}
+
+--------------------------------------------------
+
+Produce a <b>Detailed Weekly Inventory Deep Dive</b> for the Executive Team.
+Output ONLY valid HTML — no markdown, no code fences, no introductory text.
+Start directly with the first <h3> tag.
+
+REQUIRED SECTIONS:
+
+<h3>1. Actions Required ({date_start} – {date_end})</h3>
+Write 2–4 concise bullet points (<ul><li>…</li></ul>) summarising the most important actions the team must take this week.
+Be specific: name products, quantities, and urgency. If a Top Priority item has fewer than 6 weeks runway, demand immediate reorder. This section should be scannable in 10 seconds.
+
+<h3>2. Top Priority Items Snapshot</h3>
+Include only items where "Top 10" = "Yes".
+Render an HTML table with columns: SKU | Product | Current Stock | Avg Wkly Burn | Est. Runway | Status.
+In the Status column write "CRITICAL – reorder now" for runway < 4 weeks, "Low – prepare PO" for 4–8 weeks, "Healthy" for > 8 weeks.
+Add a <td style="background-color:#FFE0DC;"> inline style on any CRITICAL row's cells.
+Below the table, add a short paragraph (<p>) with a plain-English sentence for each critical item explaining the sell-out date and required action.
+
+<h3>3. Burn Rate & Velocity</h3>
+Name the top 3 fastest-moving SKUs with their burn rates.
+If historical trend data is available, note any SKUs where burn has accelerated or decelerated by more than 15%, and any stock that has dropped sharply vs four weeks ago.
+Keep this section to 4–6 bullet points.
+
+<h3>4. Restock Alerts</h3>
+List all items (Top Priority or otherwise) in the Red Zone (< 4 weeks runway) and Caution Zone (4–8 weeks runway).
+Use a compact 2-column table: Product | Estimated Runway. Apply inline style background-color:#FFE0DC for Red Zone rows, #FFF3CC for Caution Zone rows.
+If nothing falls in a zone, write "None at this time."
+
+<h3>5. Full Inventory Data Table</h3>
+HTML table with ALL items sorted highest burn rate first: SKU | Product | Current Stock | Avg Wkly Burn | Est. Runway.
+Apply inline styles: background-color:#FFE0DC on rows with runway < 4 weeks; background-color:#FFF3CC on rows with runway 4–8 weeks; background-color:#D5F5E3 on rows with runway > 8 weeks and burn > 0.
+
+<p><i>Methodology: Avg Weekly Burn is a {weeks_evaluated}-week moving average of actual stock depletion, counting only weeks with positive drawdown.</i></p>
+
+FORMAT RULES:
+- Valid HTML only. No markdown. No ** bold syntax — use <b> tags.
+- Do NOT start with any intro text or sign-off. Start with the first <h3>.
+- Tables must have a <thead> with <th> column headers.
+- Keep the report tight and scannable — executives will read this in under 2 minutes.
+"""
     
     try:
         response = client.chat.completions.create(
@@ -300,8 +376,12 @@ def main():
     # Build attachments
     date_str = week_monday.isoformat()
 
+    # Generate runway chart
+    chart_png = generate_runway_chart(summary_df)
+    chart_images = [chart_png] if chart_png else []
+
     # Generate DOCX report
-    docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str)
+    docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str, chart_images=chart_images)
 
     attachments = [(f"weekly_inventory_report_{date_str}.docx", docx_bytes)]
 
