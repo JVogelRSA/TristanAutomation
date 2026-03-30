@@ -68,7 +68,7 @@ def connect_snowflake():
 
 
 def get_sales_query(target_monday):
-    """Build the weekly sales SQL with the given Monday as target date."""
+    """Build the weekly sales SQL with proper order-level tax/shipping aggregation."""
     return f"""
     SET target_monday = '{target_monday}'::DATE;
     SET week1_start = $target_monday;
@@ -77,125 +77,192 @@ def get_sales_query(target_monday):
     SET week2_end   = DATEADD('day', -1, $week1_start);
 
     WITH
-    w1 AS (
-        SELECT
+    -- Week 1: aggregate per order first to correctly sum taxes/shipping
+    w1_orders AS (
+        SELECT NAME,
             SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303')
-                THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS gross_sales_dc1,
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_dc1,
             SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','302','303','21','22','23','25','26','28','29','30','31','32','33','34','35','36','37','38','5000')
-                THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS gross_sales_all,
-            SUM(discount_amount) AS discounts,
-            SUM(CASE WHEN lineitem_sku IN ('1','6','100','200','300','301','303','400','401','7','302') THEN lineitem_quantity ELSE 0 END) AS gross_units,
-            COUNT(DISTINCT NAME) AS order_count,
-            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS kids_rev,
-            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN lineitem_quantity ELSE 0 END) AS kids_units
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_all,
+            SUM(CASE WHEN lineitem_sku IN ('7','400','401')
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_kids,
+            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN lineitem_quantity ELSE 0 END) AS kids_units,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','100','200','300','301','303','400','401','7','302')
+                THEN lineitem_quantity ELSE 0 END) AS gross_units,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303') AND cancelled_at IS NULL
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_dc1_net,
+            SUM(CASE WHEN cancelled_at IS NOT NULL THEN lineitem_quantity ELSE 0 END) AS cancelled_units,
+            SUM(discount_amount) AS order_discounts,
+            MAX(taxes) AS order_taxes,
+            MAX(shipping) AS order_shipping
         FROM DAYLIGHT_SALES.CONNECTORS.SHOPIFY
         WHERE created_at::DATE BETWEEN $week1_start AND $week1_end
+        GROUP BY NAME
+    ),
+    w1 AS (
+        SELECT
+            SUM(line_dc1) + SUM(order_taxes) + SUM(order_shipping) AS gross_sales_dc1,
+            SUM(line_all) + SUM(order_taxes) + SUM(order_shipping) AS gross_sales_all,
+            SUM(line_kids) AS kids_rev,
+            SUM(kids_units) AS kids_units,
+            SUM(gross_units) AS gross_units,
+            SUM(cancelled_units) AS cancelled_units,
+            COUNT(*) AS order_count,
+            SUM(order_discounts) AS discounts,
+            SUM(line_dc1_net) - SUM(CASE WHEN cancelled_units = 0 THEN order_discounts ELSE 0 END) AS net_sales_dc1
+        FROM w1_orders
+    ),
+
+    -- Week 2: same order-level aggregation
+    w2_orders AS (
+        SELECT NAME,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303')
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_dc1,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','302','303','21','22','23','25','26','28','29','30','31','32','33','34','35','36','37','38','5000')
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_all,
+            SUM(CASE WHEN lineitem_sku IN ('7','400','401')
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_kids,
+            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN lineitem_quantity ELSE 0 END) AS kids_units,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','100','200','300','301','303','400','401','7','302')
+                THEN lineitem_quantity ELSE 0 END) AS gross_units,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303') AND cancelled_at IS NULL
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_dc1_net,
+            SUM(CASE WHEN cancelled_at IS NOT NULL THEN lineitem_quantity ELSE 0 END) AS cancelled_units,
+            SUM(discount_amount) AS order_discounts,
+            MAX(taxes) AS order_taxes,
+            MAX(shipping) AS order_shipping
+        FROM DAYLIGHT_SALES.CONNECTORS.SHOPIFY
+        WHERE created_at::DATE BETWEEN $week2_start AND $week2_end
+        GROUP BY NAME
     ),
     w2 AS (
         SELECT
-            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303')
-                THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS gross_sales_dc1,
-            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','302','303','21','22','23','25','26','28','29','30','31','32','33','34','35','36','37','38','5000')
-                THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS gross_sales_all,
-            SUM(discount_amount) AS discounts,
-            SUM(CASE WHEN lineitem_sku IN ('1','6','100','200','300','301','303','400','401','7','302') THEN lineitem_quantity ELSE 0 END) AS gross_units,
-            COUNT(DISTINCT NAME) AS order_count,
-            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN (lineitem_price * lineitem_quantity) ELSE 0 END) AS kids_rev,
-            SUM(CASE WHEN lineitem_sku IN ('7','400','401') THEN lineitem_quantity ELSE 0 END) AS kids_units
-        FROM DAYLIGHT_SALES.CONNECTORS.SHOPIFY
-        WHERE created_at::DATE BETWEEN $week2_start AND $week2_end
+            SUM(line_dc1) + SUM(order_taxes) + SUM(order_shipping) AS gross_sales_dc1,
+            SUM(line_all) + SUM(order_taxes) + SUM(order_shipping) AS gross_sales_all,
+            SUM(line_kids) AS kids_rev,
+            SUM(kids_units) AS kids_units,
+            SUM(gross_units) AS gross_units,
+            SUM(cancelled_units) AS cancelled_units,
+            COUNT(*) AS order_count,
+            SUM(order_discounts) AS discounts,
+            SUM(line_dc1_net) - SUM(CASE WHEN cancelled_units = 0 THEN order_discounts ELSE 0 END) AS net_sales_dc1
+        FROM w2_orders
     )
 
-    SELECT
-        'Report: ' || $week1_start || ' vs ' || $week2_start AS metric,
-        'Week 1 (Target)' AS week_1,
-        'Week 2 (Comp)' AS week_2,
-        '% Change' AS pct_change
+    SELECT 'Report: ' || $week1_start || ' vs ' || $week2_start AS metric,
+           'Week 1 (Target)' AS week_1, 'Week 2 (Comp)' AS week_2, '% Change' AS pct_change
 
     UNION ALL SELECT '=============== SALES ===============', '', '', ''
 
     UNION ALL
-    SELECT
-        'Gross Sales DC-1',
+    SELECT 'Gross Sales DC-1',
         TO_VARCHAR(w1.gross_sales_dc1, '$999,999,999'),
         TO_VARCHAR(w2.gross_sales_dc1, '$999,999,999'),
         TO_VARCHAR(ROUND((w1.gross_sales_dc1 - w2.gross_sales_dc1) / NULLIF(w2.gross_sales_dc1, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Gross Sales All Products',
+    SELECT 'Gross Sales All Products',
         TO_VARCHAR(w1.gross_sales_all, '$999,999,999'),
         TO_VARCHAR(w2.gross_sales_all, '$999,999,999'),
         TO_VARCHAR(ROUND((w1.gross_sales_all - w2.gross_sales_all) / NULLIF(w2.gross_sales_all, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Average Daily Sales (DC-1)',
+    SELECT 'Average Daily Sales (DC-1)',
         TO_VARCHAR(w1.gross_sales_dc1 / 7, '$999,999,999'),
         TO_VARCHAR(w2.gross_sales_dc1 / 7, '$999,999,999'),
         TO_VARCHAR(ROUND(((w1.gross_sales_dc1 / 7) - (w2.gross_sales_dc1 / 7)) / NULLIF(w2.gross_sales_dc1 / 7, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Kids Revenue',
-        TO_VARCHAR(w1.kids_rev, '$999,999,999'),
-        TO_VARCHAR(w2.kids_rev, '$999,999,999'),
-        TO_VARCHAR(ROUND((w1.kids_rev - w2.kids_rev) / NULLIF(w2.kids_rev, 0) * 100, 1)) || '%'
+    SELECT 'Net Sales DC-1 (- canc, disc)',
+        TO_VARCHAR(w1.net_sales_dc1, '$999,999,999'),
+        TO_VARCHAR(w2.net_sales_dc1, '$999,999,999'),
+        TO_VARCHAR(ROUND((w1.net_sales_dc1 - w2.net_sales_dc1) / NULLIF(w2.net_sales_dc1, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Kids % of Total Revenue',
-        TO_VARCHAR(ROUND(w1.kids_rev / NULLIF(w1.gross_sales_dc1, 0) * 100, 1)) || '%',
-        TO_VARCHAR(ROUND(w2.kids_rev / NULLIF(w2.gross_sales_dc1, 0) * 100, 1)) || '%',
-        TO_VARCHAR(ROUND((w1.kids_rev / NULLIF(w1.gross_sales_dc1, 0) * 100) - (w2.kids_rev / NULLIF(w2.gross_sales_dc1, 0) * 100), 1)) || ' pts'
-    FROM w1, w2
-
-    UNION ALL
-    SELECT
-        'Total Discounts',
+    SELECT 'Total Discounts',
         TO_VARCHAR(w1.discounts, '$999,999,999'),
         TO_VARCHAR(w2.discounts, '$999,999,999'),
         TO_VARCHAR(ROUND((w1.discounts - w2.discounts) / NULLIF(w2.discounts, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Order Count',
-        TO_VARCHAR(w1.order_count),
-        TO_VARCHAR(w2.order_count),
-        TO_VARCHAR(ROUND((w1.order_count - w2.order_count) / NULLIF(w2.order_count, 0) * 100, 1)) || '%'
+    SELECT 'Discount Rate %',
+        TO_VARCHAR(ROUND(w1.discounts / NULLIF(w1.gross_sales_dc1, 0) * 100, 2)) || '%',
+        TO_VARCHAR(ROUND(w2.discounts / NULLIF(w2.gross_sales_dc1, 0) * 100, 2)) || '%',
+        TO_VARCHAR(ROUND((w1.discounts / NULLIF(w1.gross_sales_dc1, 0) * 100) - (w2.discounts / NULLIF(w2.gross_sales_dc1, 0) * 100), 2)) || ' pts'
+    FROM w1, w2
+
+    UNION ALL SELECT '=============== KIDS ===============', '', '', ''
+
+    UNION ALL
+    SELECT 'Kids Revenue',
+        TO_VARCHAR(w1.kids_rev, '$999,999,999'),
+        TO_VARCHAR(w2.kids_rev, '$999,999,999'),
+        TO_VARCHAR(ROUND((w1.kids_rev - w2.kids_rev) / NULLIF(w2.kids_rev, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'AOV (DC-1)',
-        TO_VARCHAR(w1.gross_sales_dc1 / NULLIF(w1.order_count, 0), '$999,999'),
-        TO_VARCHAR(w2.gross_sales_dc1 / NULLIF(w2.order_count, 0), '$999,999'),
-        TO_VARCHAR(ROUND(
-            (w1.gross_sales_dc1 / NULLIF(w1.order_count, 0) - w2.gross_sales_dc1 / NULLIF(w2.order_count, 0))
-            / NULLIF(w2.gross_sales_dc1 / NULLIF(w2.order_count, 0), 0) * 100, 1)) || '%'
+    SELECT 'Kids Units Sold',
+        TO_VARCHAR(w1.kids_units), TO_VARCHAR(w2.kids_units),
+        TO_VARCHAR(ROUND((w1.kids_units - w2.kids_units) / NULLIF(w2.kids_units, 0) * 100, 1)) || '%'
+    FROM w1, w2
+
+    UNION ALL
+    SELECT 'Kids % of Total Revenue',
+        TO_VARCHAR(ROUND(w1.kids_rev / NULLIF(w1.gross_sales_dc1, 0) * 100, 1)) || '%',
+        TO_VARCHAR(ROUND(w2.kids_rev / NULLIF(w2.gross_sales_dc1, 0) * 100, 1)) || '%',
+        TO_VARCHAR(ROUND((w1.kids_rev / NULLIF(w1.gross_sales_dc1, 0) * 100) - (w2.kids_rev / NULLIF(w2.gross_sales_dc1, 0) * 100), 1)) || ' pts'
+    FROM w1, w2
+
+    UNION ALL
+    SELECT 'Kids % of Total Units',
+        TO_VARCHAR(ROUND(w1.kids_units / NULLIF(w1.gross_units, 0) * 100, 1)) || '%',
+        TO_VARCHAR(ROUND(w2.kids_units / NULLIF(w2.gross_units, 0) * 100, 1)) || '%',
+        TO_VARCHAR(ROUND((w1.kids_units / NULLIF(w1.gross_units, 0) * 100) - (w2.kids_units / NULLIF(w2.gross_units, 0) * 100), 1)) || ' pts'
     FROM w1, w2
 
     UNION ALL SELECT '=============== UNITS ===============', '', '', ''
 
     UNION ALL
-    SELECT
-        'Total Units Sold',
-        TO_VARCHAR(w1.gross_units),
-        TO_VARCHAR(w2.gross_units),
+    SELECT 'Order Count', TO_VARCHAR(w1.order_count), TO_VARCHAR(w2.order_count),
+        TO_VARCHAR(ROUND((w1.order_count - w2.order_count) / NULLIF(w2.order_count, 0) * 100, 1)) || '%'
+    FROM w1, w2
+
+    UNION ALL
+    SELECT 'Total Units Sold', TO_VARCHAR(w1.gross_units), TO_VARCHAR(w2.gross_units),
         TO_VARCHAR(ROUND((w1.gross_units - w2.gross_units) / NULLIF(w2.gross_units, 0) * 100, 1)) || '%'
     FROM w1, w2
 
     UNION ALL
-    SELECT
-        'Kids Units Sold',
-        TO_VARCHAR(w1.kids_units),
-        TO_VARCHAR(w2.kids_units),
-        TO_VARCHAR(ROUND((w1.kids_units - w2.kids_units) / NULLIF(w2.kids_units, 0) * 100, 1)) || '%'
+    SELECT 'Cancelled Units', TO_VARCHAR(w1.cancelled_units), TO_VARCHAR(w2.cancelled_units),
+        TO_VARCHAR(ROUND((w1.cancelled_units - w2.cancelled_units) / NULLIF(w2.cancelled_units, 0) * 100, 1)) || '%'
+    FROM w1, w2
+
+    UNION ALL SELECT '=============== CALCULATED ===============', '', '', ''
+
+    UNION ALL
+    SELECT 'AOV (DC-1)',
+        TO_VARCHAR(ROUND(w1.gross_sales_dc1 / NULLIF(w1.order_count, 0), 2), '$999,999'),
+        TO_VARCHAR(ROUND(w2.gross_sales_dc1 / NULLIF(w2.order_count, 0), 2), '$999,999'),
+        TO_VARCHAR(ROUND(((w1.gross_sales_dc1 / NULLIF(w1.order_count, 0)) - (w2.gross_sales_dc1 / NULLIF(w2.order_count, 0))) / NULLIF(w2.gross_sales_dc1 / NULLIF(w2.order_count, 0), 0) * 100, 1)) || '%'
+    FROM w1, w2
+
+    UNION ALL
+    SELECT 'Revenue per Unit',
+        TO_VARCHAR(ROUND(w1.gross_sales_dc1 / NULLIF(w1.gross_units, 0), 2), '$999,999'),
+        TO_VARCHAR(ROUND(w2.gross_sales_dc1 / NULLIF(w2.gross_units, 0), 2), '$999,999'),
+        TO_VARCHAR(ROUND(((w1.gross_sales_dc1 / NULLIF(w1.gross_units, 0)) - (w2.gross_sales_dc1 / NULLIF(w2.gross_units, 0))) / NULLIF(w2.gross_sales_dc1 / NULLIF(w2.gross_units, 0), 0) * 100, 1)) || '%'
+    FROM w1, w2
+
+    UNION ALL
+    SELECT 'Cancellation Rate %',
+        TO_VARCHAR(ROUND(w1.cancelled_units / NULLIF(w1.gross_units, 0) * 100, 2)) || '%',
+        TO_VARCHAR(ROUND(w2.cancelled_units / NULLIF(w2.gross_units, 0) * 100, 2)) || '%',
+        TO_VARCHAR(ROUND((w1.cancelled_units / NULLIF(w1.gross_units, 0) * 100) - (w2.cancelled_units / NULLIF(w2.gross_units, 0) * 100), 2)) || ' pts'
     FROM w1, w2;
     """
 
@@ -298,9 +365,11 @@ def parse_metrics_from_results(df):
         key_map = {
             'Gross Sales DC-1': 'gross_sales_dc1',
             'Gross Sales All Products': 'gross_sales_all',
+            'Net Sales DC-1 (- canc, disc)': 'net_sales_dc1',
             'Kids Revenue': 'kids_rev',
             'Total Units Sold': 'gross_units',
             'Kids Units Sold': 'kids_units',
+            'Cancelled Units': 'cancelled_units',
             'Order Count': 'order_count',
             'Total Discounts': 'discounts',
         }
