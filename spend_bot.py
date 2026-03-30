@@ -157,7 +157,9 @@ FORMAT RULES:
         return report_html, curr_df, snapshot
     except Exception as e:
         print(f"Error generating LLM report: {e}")
-        return "<p>Error generating report.</p>", curr_df, {}
+        import traceback
+        traceback.print_exc()
+        return f"<p><b>Error generating report:</b> {e}</p>", curr_df, {}
 
 def main():
     print("Starting Spend Analysis Bot...")
