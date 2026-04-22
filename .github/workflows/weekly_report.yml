@@ -17,7 +17,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
@@ -35,6 +35,7 @@ jobs:
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         EMAIL_SUBJECT_KEYWORD: ${{ secrets.EMAIL_SUBJECT_KEYWORD }}
       run: python inventory_bot.py
 
@@ -50,7 +51,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
@@ -65,9 +66,11 @@ jobs:
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         BREX_API_KEY: ${{ secrets.BREX_API_KEY }}
         MERCURY_API_KEY: ${{ secrets.MERCURY_API_KEY }}
         RIPPLING_API_KEY: ${{ secrets.RIPPLING_API_KEY }}
+        CASH_BALANCE_USD: ${{ secrets.CASH_BALANCE_USD }}
       run: python spend_bot.py
 
   sales-summary:
@@ -80,12 +83,21 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Write Snowflake private key
+      env:
+        SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      if: env.SNOWFLAKE_PRIVATE_KEY != ''
+      run: |
+        mkdir -p ~/.ssh/snowflake
+        printf '%s\n' "$SNOWFLAKE_PRIVATE_KEY" > ~/.ssh/snowflake/snowflake_key.p8
+        chmod 600 ~/.ssh/snowflake/snowflake_key.p8
 
     - name: Run Sales Bot
       env:
@@ -95,10 +107,12 @@ jobs:
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
         SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
         SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
         SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
         SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
         SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        SNOWFLAKE_PRIVATE_KEY_PATH: /home/runner/.ssh/snowflake/snowflake_key.p8
       run: python sales_bot.py
