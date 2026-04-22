@@ -168,49 +168,22 @@ def compose_weekly_email(
     sales: dict,
     spend: dict,
     inventory: dict,
-) -> tuple[str, list[tuple[str, bytes, str]]]:
+) -> tuple[str, list]:
     """
-    Build the HTML body + list of inline (CID) images.
+    Build the HTML body.
 
     Each section dict expects:
       - 'html' (str)                — LLM-generated report HTML
       - 'headline' (dict, optional) — headline metrics for the top KPI strip
-      - 'chart_png' (bytes, optional)
-      - 'chart_cid' (str, optional) — short id referenced from the HTML
 
     Returns
     -------
     (html_body, inline_images)
-      inline_images: list of (cid, png_bytes, mime_subtype) to attach as MIMEImage.
+      inline_images is always an empty list (kept in the signature so the
+      send_unified_email plumbing stays unchanged if we re-introduce inline
+      images later that actually earn their space).
     """
     generated_at = datetime.now().strftime("%B %d, %Y · %I:%M %p")
-
-    # --- Collect inline images ------------------------------------
-    inline_images: list[tuple[str, bytes, str]] = []
-    sales_chart_block = ""
-    inv_chart_block = ""
-
-    if sales.get("chart_png"):
-        cid = sales.get("chart_cid", "sales_sparkline")
-        inline_images.append((cid, sales["chart_png"], "png"))
-        sales_chart_block = f"""
-        <tr><td style="padding:0 30px 4px 30px;">
-          <img src="cid:{cid}" alt="8-week sales trend"
-               style="display:block; width:100%; max-width:660px;
-                      height:auto; border:0; border-radius:6px;">
-        </td></tr>
-        """
-
-    if inventory.get("chart_png"):
-        cid = inventory.get("chart_cid", "inventory_runway")
-        inline_images.append((cid, inventory["chart_png"], "png"))
-        inv_chart_block = f"""
-        <tr><td style="padding:0 30px 4px 30px;">
-          <img src="cid:{cid}" alt="Inventory stock runway"
-               style="display:block; width:100%; max-width:660px;
-                      height:auto; border:0; border-radius:6px;">
-        </td></tr>
-        """
 
     # --- Exec snapshot cards --------------------------------------
     sales_h = sales.get("headline") or {}
@@ -335,7 +308,6 @@ def compose_weekly_email(
 
       <!-- Sales -->
       {_section_header("📈", "Sales", f"DC-1 · Week of {week_monday}")}
-      {sales_chart_block}
       {_wrap_report_section(sales_html)}
 
       <!-- Spend -->
@@ -344,7 +316,6 @@ def compose_weekly_email(
 
       <!-- Inventory -->
       {_section_header("📦", "Inventory", "Stockout ETA · Reorder Queue")}
-      {inv_chart_block}
       {_wrap_report_section(inv_html)}
 
       <!-- Attachments footer -->
@@ -372,7 +343,7 @@ def compose_weekly_email(
 </body>
 </html>"""
 
-    return html, inline_images
+    return html, []
 
 
 def send_unified_email(

@@ -2,9 +2,6 @@ import os
 import io
 from datetime import datetime, timedelta
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -338,66 +335,6 @@ def fetch_sales_data():
         return pd.DataFrame(), pd.DataFrame()
 
 
-def generate_revenue_sparkline(history: list, current_metrics: dict) -> bytes | None:
-    """
-    Render an 8-week revenue trend sparkline. Uses saved snapshots + this week's
-    current metrics. Returns PNG bytes or None if <2 data points.
-    """
-    if not history and not current_metrics:
-        return None
-
-    series = []
-    labels = []
-    for h in (history or [])[-7:]:
-        if 'gross_sales_dc1' in h:
-            series.append(float(h['gross_sales_dc1']))
-            labels.append(h.get('week_monday', '')[-5:])  # MM-DD
-    if 'gross_sales_dc1' in current_metrics:
-        series.append(float(current_metrics['gross_sales_dc1']))
-        labels.append('This wk')
-
-    if len(series) < 2:
-        return None
-
-    fig, ax = plt.subplots(figsize=(8, 2.8))
-    fig.patch.set_facecolor('#FAFAFA')
-    ax.set_facecolor('#FAFAFA')
-
-    x = list(range(len(series)))
-    ax.plot(x, series, marker='o', linewidth=2.2, color='#1E3A5F',
-            markerfacecolor='#1E3A5F', markersize=6)
-    # Highlight current week
-    ax.plot(x[-1], series[-1], marker='o', markersize=11,
-            markerfacecolor='#C0392B', markeredgecolor='white', zorder=5)
-
-    for xi, val in zip(x, series):
-        ax.annotate(f"${val/1000:.1f}k", (xi, val),
-                    textcoords="offset points", xytext=(0, 10),
-                    ha='center', fontsize=8.5, color='#333333')
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8, color='#444')
-    ax.set_title('Weekly Gross Sales (DC-1) — 8 week trend',
-                 fontsize=11, fontweight='bold', color='#1E3A5F', pad=10)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v/1000:.0f}k"))
-    for spine in ('top', 'right'):
-        ax.spines[spine].set_visible(False)
-    ax.spines['left'].set_color('#CCCCCC')
-    ax.spines['bottom'].set_color('#CCCCCC')
-    ax.tick_params(axis='both', labelsize=8.5, colors='#444')
-    ax.grid(True, axis='y', linestyle=':', linewidth=0.6, alpha=0.6)
-    ax.set_axisbelow(True)
-
-    # Give the annotations headroom
-    ax.set_ylim(0, max(series) * 1.22)
-
-    plt.tight_layout(pad=1.2)
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
-    plt.close(fig)
-    return buf.getvalue()
-
-
 def build_sales_comparison(history, current_metrics):
     """Build historical comparison string for the LLM prompt."""
     if not history:
@@ -601,16 +538,10 @@ def main():
     if metrics:
         save_weekly_snapshot("sales", week_monday, metrics)
 
-    # 4. Build attachments — embed the 8-week sparkline above the HTML body
+    # 4. Build attachments
     date_str = week_monday.isoformat()
 
-    sparkline_png = generate_revenue_sparkline(history, metrics)
-    chart_images = [sparkline_png] if sparkline_png else []
-
-    docx_bytes = html_to_docx(
-        report_html, "Weekly Sales Summary", date_str,
-        chart_images=chart_images,
-    )
+    docx_bytes = html_to_docx(report_html, "Weekly Sales Summary", date_str)
 
     csv_io = io.BytesIO()
     df.to_csv(csv_io, index=False)

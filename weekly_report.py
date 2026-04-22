@@ -39,14 +39,12 @@ from adapters.rippling import fetch_rippling_expenses
 from sales_bot import (
     fetch_sales_data,
     generate_sales_report,
-    generate_revenue_sparkline,
     parse_metrics_from_results,
 )
 
 from inventory_bot import (
     fetch_latest_emails,
     generate_llm_report as generate_inventory_report,
-    generate_runway_chart,
 )
 
 
@@ -161,17 +159,11 @@ def build_sales_section():
         "kids_pct": kids_pct_str,
     }
 
-    # Chart — 8-week sparkline
-    sparkline_png = generate_revenue_sparkline(history, metrics)
-
     # Attachments
     week_monday = get_week_monday()
     date_str = week_monday.isoformat()
 
-    docx_bytes = html_to_docx(
-        report_html, "Weekly Sales Summary", date_str,
-        chart_images=[sparkline_png] if sparkline_png else [],
-    )
+    docx_bytes = html_to_docx(report_html, "Weekly Sales Summary", date_str)
 
     csv_io = io.BytesIO()
     df.to_csv(csv_io, index=False)
@@ -194,13 +186,11 @@ def build_sales_section():
         "attachments": attachments,
         "attachment_names": [a[0] for a in attachments],
         "snapshot": metrics,
-        "chart_png": sparkline_png,
-        "chart_cid": "sales_sparkline",
     }
 
 
 def build_inventory_section():
-    """Run inventory bot data pipeline; return dict with html + chart + attachments."""
+    """Run inventory bot data pipeline; return dict + attachments list."""
     print("[inventory] fetching DCL inventory emails …")
     data = fetch_latest_emails(limit=4)
     if len(data) == 0:
@@ -211,7 +201,6 @@ def build_inventory_section():
             "attachments": [],
             "attachment_names": [],
             "snapshot": {},
-            "chart_png": None,
         }
 
     history = load_history("inventory")
@@ -236,16 +225,11 @@ def build_inventory_section():
         "critical_sub": critical_sub,
     }
 
-    chart_png = generate_runway_chart(summary_df)
-
     # Attachments
     week_monday = get_week_monday()
     date_str = week_monday.isoformat()
 
-    docx_bytes = html_to_docx(
-        report_html, "Weekly Inventory Report", date_str,
-        chart_images=[chart_png] if chart_png else [],
-    )
+    docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str)
 
     attachments: list[tuple[str, bytes]] = [
         (f"weekly_inventory_report_{date_str}.docx", docx_bytes),
@@ -265,8 +249,6 @@ def build_inventory_section():
         "attachments": attachments,
         "attachment_names": [a[0] for a in attachments],
         "snapshot": snapshot,
-        "chart_png": chart_png,
-        "chart_cid": "inventory_runway",
     }
 
 
@@ -288,7 +270,7 @@ def main(test_mode: bool = False) -> None:
         sales = build_sales_section()
     except Exception as e:
         import traceback; traceback.print_exc()
-        sales = {"html": f"<p><b>Sales section failed:</b> {e}</p>", "headline": {}, "attachments": [], "attachment_names": [], "snapshot": {}, "chart_png": None}
+        sales = {"html": f"<p><b>Sales section failed:</b> {e}</p>", "headline": {}, "attachments": [], "attachment_names": [], "snapshot": {}}
 
     try:
         spend = build_spend_section()
@@ -300,7 +282,7 @@ def main(test_mode: bool = False) -> None:
         inventory = build_inventory_section()
     except Exception as e:
         import traceback; traceback.print_exc()
-        inventory = {"html": f"<p><b>Inventory section failed:</b> {e}</p>", "headline": {}, "attachments": [], "attachment_names": [], "snapshot": {}, "chart_png": None}
+        inventory = {"html": f"<p><b>Inventory section failed:</b> {e}</p>", "headline": {}, "attachments": [], "attachment_names": [], "snapshot": {}}
 
     # Save snapshots for future runs (only if the section succeeded and has a snapshot)
     if sales.get("snapshot"):

@@ -2,9 +2,6 @@ import os
 import io
 from datetime import datetime, timedelta
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from imap_tools import MailBox, AND
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -137,6 +134,44 @@ def _lead_time(sku: str) -> int:
     return LEAD_TIME_WEEKS.get(sku, DEFAULT_LEAD_TIME_WEEKS)
 
 
+def _clean_csv_description(desc: str) -> str:
+    """
+    DCL's CSV Description column often contains name + sub-description concatenated
+    (e.g. "Daylight DC-1 Daylight Computer", "Amber Sunday Bundle (2025) SKU: 1 + 34...").
+    Strip the noisy tail so we get just the product name.
+    """
+    if not desc:
+        return ''
+    d = desc.strip()
+    # Cut at "SKU:" (bundle composition) / "Bundle:" / a period followed by a cap
+    for sep in [' SKU:', ' Bundle:', '. ', ': ']:
+        idx = d.find(sep)
+        if idx > 2:
+            d = d[:idx].rstrip(' .,-')
+            break
+    # Collapse whitespace
+    d = ' '.join(d.split())
+    # De-duplicate obvious "Daylight DC-1 Daylight Computer" tail
+    for dup_tail in [' Daylight Computer', ' Daylight Computer Kids Bundle']:
+        if d.endswith(dup_tail) and d.count('Daylight') >= 2:
+            d = d[: -len(dup_tail)].rstrip()
+    return d.strip() or desc.strip()
+
+
+def _resolve_product_name(sku: str, csv_descriptions: dict) -> str:
+    """
+    Resolve the display name for a SKU. Priority:
+      1. SKU_MAP override (if we've explicitly chosen a prettier name)
+      2. CSV Description column (DCL's source of truth)
+      3. Bare SKU code (last-resort fallback)
+    """
+    if sku in SKU_MAP:
+        return SKU_MAP[sku]
+    if sku in csv_descriptions and csv_descriptions[sku]:
+        return csv_descriptions[sku]
+    return sku
+
+
 def _compute_stockout_and_reorder(stock: float, weekly_burn: float, sku: str, today: datetime):
     """
     Given current stock + burn rate, return:
@@ -180,73 +215,6 @@ def _compute_velocity_change(sku: str, curr_burn: float, history: list) -> str:
     pct = ((curr_burn - prev) / prev) * 100
     sign = '+' if pct > 0 else ''
     return f"{sign}{pct:.0f}%"
-
-def generate_runway_chart(summary_df: pd.DataFrame) -> bytes | None:
-    """
-    Render a horizontal bar chart of stock runway by product.
-    Colour-coded: red < 4 wks, orange 4–8 wks, green > 8 wks.
-    Returns PNG bytes, or None if there is nothing to chart.
-    """
-    def parse_runway(s):
-        try:
-            return float(str(s).replace(' weeks', '').strip())
-        except (ValueError, TypeError):
-            return None
-
-    df = summary_df[summary_df['Avg Wkly Burn'] > 0].copy()
-    df['Runway_Float'] = df['Runway (Est)'].apply(parse_runway)
-    df = df.dropna(subset=['Runway_Float']).sort_values('Runway_Float')
-
-    if df.empty:
-        return None
-
-    DISPLAY_CAP = 30
-    df['Runway_Display'] = df['Runway_Float'].clip(upper=DISPLAY_CAP)
-
-    colours = [
-        '#C0392B' if r < 4 else '#E67E22' if r < 8 else '#27AE60'
-        for r in df['Runway_Float']
-    ]
-
-    fig_height = max(3.0, len(df) * 0.48)
-    fig, ax = plt.subplots(figsize=(8, fig_height))
-    fig.patch.set_facecolor('#FAFAFA')
-    ax.set_facecolor('#FAFAFA')
-
-    bars = ax.barh(
-        df['Product'], df['Runway_Display'],
-        color=colours, edgecolor='white', height=0.58
-    )
-
-    for bar, val in zip(bars, df['Runway_Float']):
-        label = f"{val:.1f} wks" if val <= DISPLAY_CAP else f"{val:.0f}+ wks"
-        ax.text(
-            bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
-            label, va='center', ha='left', fontsize=8.5, color='#333333'
-        )
-
-    ax.axvline(4,  color='#C0392B', linestyle='--', linewidth=1.1, alpha=0.75, label='4-week Critical Zone')
-    ax.axvline(8,  color='#E67E22', linestyle='--', linewidth=1.1, alpha=0.75, label='8-week Caution Zone')
-
-    ax.set_xlabel('Estimated Stock Runway (weeks)', fontsize=9, color='#444')
-    ax.set_title('Stock Runway by Product', fontsize=12, fontweight='bold',
-                 color='#1E3A5F', pad=12)
-    ax.legend(fontsize=8, loc='lower right', framealpha=0.7)
-    ax.set_xlim(0, max(DISPLAY_CAP + 2, df['Runway_Display'].max() + 3))
-    for spine in ('top', 'right'):
-        ax.spines[spine].set_visible(False)
-    ax.spines['left'].set_color('#CCCCCC')
-    ax.spines['bottom'].set_color('#CCCCCC')
-    ax.tick_params(axis='both', labelsize=8.5, colors='#444')
-    ax.xaxis.grid(True, linestyle=':', linewidth=0.6, alpha=0.6)
-    ax.set_axisbelow(True)
-
-    plt.tight_layout(pad=1.2)
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
-    plt.close(fig)
-    return buf.getvalue()
-
 
 def fetch_latest_emails(limit=4):
     """
@@ -304,15 +272,28 @@ def generate_llm_report(dfs_data, history=None):
 
     # Use the latest DF for the baseline schema
     curr_date, curr_df = dfs_data[-1]
-    
-    # Attempt to identify the 'Item Name' and 'Quantity' columns
+
+    # Attempt to identify the 'Item Name', 'Quantity', and 'Description' columns
     item_col = next((c for c in curr_df.columns if 'item' in c.lower() or 'sku' in c.lower()), curr_df.columns[0])
     qty_col = next((c for c in curr_df.columns if 'hand' in c.lower() or 'qty' in c.lower() or 'available' in c.lower()), curr_df.columns[-1])
-    
-    print(f"Using columns: Item='{item_col}', Qty='{qty_col}'")
+    desc_col = next((c for c in curr_df.columns if 'descrip' in c.lower() or 'name' in c.lower() or 'product' in c.lower()), None)
+
+    print(f"Using columns: Item='{item_col}', Qty='{qty_col}', Desc='{desc_col}'")
+
+    # Build a SKU → description lookup from the CSV's Description column.
+    # This is the ground truth maintained by DCL — we use it as the primary
+    # source of product names. SKU_MAP (below) is applied only as an override
+    # when we want a prettier display name than DCL's raw description.
+    csv_descriptions: dict[str, str] = {}
+    if desc_col is not None:
+        for _, row in curr_df.iterrows():
+            sku = str(row[item_col]).strip()
+            desc = str(row[desc_col]).strip() if pd.notna(row[desc_col]) else ''
+            if sku and desc and sku not in csv_descriptions:
+                csv_descriptions[sku] = _clean_csv_description(desc)
 
     summary_data = []
-    
+
     # Create lookups for all historical weeks to track changes accurately
     hist_lookups = []
     for date, df in dfs_data:
@@ -354,8 +335,8 @@ def generate_llm_report(dfs_data, history=None):
         # Velocity change vs last week's snapshot
         velocity_str = _compute_velocity_change(sku, avg_weekly_burn, history or [])
 
-        # Mapping Names and Priority
-        product_name = SKU_MAP.get(sku, sku)
+        # Mapping Names and Priority — CSV Description is primary, SKU_MAP overrides
+        product_name = _resolve_product_name(sku, csv_descriptions)
         is_top = "Yes" if sku in TOP_PRIORITY_SKUS else "No"
 
         summary_data.append({
@@ -371,29 +352,39 @@ def generate_llm_report(dfs_data, history=None):
             'WoW Velocity': velocity_str,
         })
         
-    # Inject any explicitly mapped SKUs that were completely missing from the latest CSV
-    processed_skus = [d['SKU'] for d in summary_data]
-    for missing_sku, missing_product in SKU_MAP.items():
-        if missing_sku not in processed_skus:
-            is_top = "Yes" if missing_sku in TOP_PRIORITY_SKUS else "No"
-            summary_data.append({
-                'SKU': missing_sku,
-                'Product': missing_product,
-                'Top 10': is_top,
-                'Current Stock': 0,
-                'Avg Wkly Burn': 0.0,
-                'Runway (Est)': 'N/A',
-                'Stockout ETA': 'N/A',
-                'Lead Time (wks)': _lead_time(missing_sku),
-                'Reorder': 'OK',
-                'WoW Velocity': '—',
-            })
+    # Inject any top-priority SKUs that were completely missing from the latest CSV.
+    # We only bother doing this for SKUs we actively care about (TOP_PRIORITY_SKUS or
+    # anything hard-coded in SKU_MAP) — auto-injecting every known SKU bloats the
+    # report with zero-stock placeholder rows that don't help the reader.
+    processed_skus = {d['SKU'] for d in summary_data}
+    must_appear = set(TOP_PRIORITY_SKUS) | set(SKU_MAP.keys())
+    for missing_sku in must_appear - processed_skus:
+        is_top = "Yes" if missing_sku in TOP_PRIORITY_SKUS else "No"
+        summary_data.append({
+            'SKU': missing_sku,
+            'Product': _resolve_product_name(missing_sku, csv_descriptions),
+            'Top 10': is_top,
+            'Current Stock': 0,
+            'Avg Wkly Burn': 0.0,
+            'Runway (Est)': 'N/A',
+            'Stockout ETA': 'N/A',
+            'Lead Time (wks)': _lead_time(missing_sku),
+            'Reorder': 'OK',
+            'WoW Velocity': '—',
+        })
             
     summary_df = pd.DataFrame(summary_data)
-    
-    # Filter to send a meaningful subset to LLM (all tracked SKUs + anything with burn)
-    tracked_skus = list(SKU_MAP.keys())
-    active_items = summary_df[(summary_df['Avg Wkly Burn'] > 0) | (summary_df['SKU'].isin(tracked_skus))]
+
+    # Filter to send a meaningful subset to LLM:
+    #   - anything actively moving (burn > 0), OR
+    #   - anything holding meaningful stock (>= 20 units), OR
+    #   - anything we've explicitly named as top priority / mapped
+    tracked_skus = set(TOP_PRIORITY_SKUS) | set(SKU_MAP.keys())
+    active_items = summary_df[
+        (summary_df['Avg Wkly Burn'] > 0)
+        | (summary_df['Current Stock'] >= 20)
+        | (summary_df['SKU'].isin(tracked_skus))
+    ]
     
     # Sort strictly by Burn Rate descending before passing to LLM
     active_items = active_items.sort_values(by='Avg Wkly Burn', ascending=False)
@@ -531,12 +522,9 @@ def main():
     # Build attachments
     date_str = week_monday.isoformat()
 
-    # Generate runway chart
-    chart_png = generate_runway_chart(summary_df)
-    chart_images = [chart_png] if chart_png else []
-
-    # Generate DOCX report
-    docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str, chart_images=chart_images)
+    # Generate DOCX report (no embedded chart — the colour-coded tables
+    # in the HTML already communicate the runway status)
+    docx_bytes = html_to_docx(report_html, "Weekly Inventory Report", date_str)
 
     attachments = [(f"weekly_inventory_report_{date_str}.docx", docx_bytes)]
 
