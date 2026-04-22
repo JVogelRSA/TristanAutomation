@@ -2,6 +2,9 @@ import os
 import io
 from datetime import datetime, timedelta
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -267,11 +270,36 @@ def get_sales_query(target_monday):
     """
 
 
+def get_daily_breakdown_query(target_monday):
+    """Daily gross sales (DC-1) for the target week — for intra-week analysis."""
+    return f"""
+    WITH daily AS (
+        SELECT
+            created_at::DATE AS day,
+            NAME,
+            SUM(CASE WHEN lineitem_sku IN ('1','6','6-k','100','200','300','301','400','401','7','303')
+                THEN lineitem_price * lineitem_quantity ELSE 0 END) AS line_dc1,
+            MAX(taxes) AS order_taxes,
+            MAX(shipping) AS order_shipping
+        FROM DAYLIGHT_SALES.CONNECTORS.SHOPIFY
+        WHERE created_at::DATE BETWEEN '{target_monday}'::DATE AND DATEADD('day', 6, '{target_monday}'::DATE)
+        GROUP BY day, NAME
+    )
+    SELECT
+        TO_CHAR(day, 'YYYY-MM-DD (Dy)') AS day,
+        TO_VARCHAR(SUM(line_dc1) + SUM(order_taxes) + SUM(order_shipping), '$999,999,999') AS gross_sales_dc1,
+        COUNT(DISTINCT NAME) AS orders
+    FROM daily
+    GROUP BY day
+    ORDER BY day;
+    """
+
+
 def fetch_sales_data():
-    """Connect to Snowflake and run the weekly sales query."""
+    """Connect to Snowflake and run both the weekly summary query and the daily breakdown."""
     if not SNOWFLAKE_USER or not SNOWFLAKE_ACCOUNT:
         print("Snowflake: Missing credentials.")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     print("Connecting to Snowflake...")
     try:
@@ -283,6 +311,7 @@ def fetch_sales_data():
         target_monday = (get_week_monday() - timedelta(days=7)).isoformat()
         print(f"Executing SQL for week starting: {target_monday}")
 
+        # --- Weekly summary ----------------------------------
         sql_script = get_sales_query(target_monday)
         commands = [cmd.strip() for cmd in sql_script.split(';') if cmd.strip()]
 
@@ -291,17 +320,82 @@ def fetch_sales_data():
             cur.execute(cmd)
             if i == len(commands) - 1:
                 results_df = cur.fetch_pandas_all()
+        print(f"Fetched {len(results_df)} weekly summary rows.")
+
+        # --- Daily breakdown ---------------------------------
+        cur.execute(get_daily_breakdown_query(target_monday))
+        daily_df = cur.fetch_pandas_all()
+        print(f"Fetched {len(daily_df)} daily rows.")
 
         cur.close()
         ctx.close()
-        print(f"Fetched {len(results_df)} rows.")
-        return results_df
+        return results_df, daily_df
 
     except Exception as e:
         print(f"Snowflake Error: {e}")
         import traceback
         traceback.print_exc()
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def generate_revenue_sparkline(history: list, current_metrics: dict) -> bytes | None:
+    """
+    Render an 8-week revenue trend sparkline. Uses saved snapshots + this week's
+    current metrics. Returns PNG bytes or None if <2 data points.
+    """
+    if not history and not current_metrics:
+        return None
+
+    series = []
+    labels = []
+    for h in (history or [])[-7:]:
+        if 'gross_sales_dc1' in h:
+            series.append(float(h['gross_sales_dc1']))
+            labels.append(h.get('week_monday', '')[-5:])  # MM-DD
+    if 'gross_sales_dc1' in current_metrics:
+        series.append(float(current_metrics['gross_sales_dc1']))
+        labels.append('This wk')
+
+    if len(series) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 2.8))
+    fig.patch.set_facecolor('#FAFAFA')
+    ax.set_facecolor('#FAFAFA')
+
+    x = list(range(len(series)))
+    ax.plot(x, series, marker='o', linewidth=2.2, color='#1E3A5F',
+            markerfacecolor='#1E3A5F', markersize=6)
+    # Highlight current week
+    ax.plot(x[-1], series[-1], marker='o', markersize=11,
+            markerfacecolor='#C0392B', markeredgecolor='white', zorder=5)
+
+    for xi, val in zip(x, series):
+        ax.annotate(f"${val/1000:.1f}k", (xi, val),
+                    textcoords="offset points", xytext=(0, 10),
+                    ha='center', fontsize=8.5, color='#333333')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8, color='#444')
+    ax.set_title('Weekly Gross Sales (DC-1) — 8 week trend',
+                 fontsize=11, fontweight='bold', color='#1E3A5F', pad=10)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v/1000:.0f}k"))
+    for spine in ('top', 'right'):
+        ax.spines[spine].set_visible(False)
+    ax.spines['left'].set_color('#CCCCCC')
+    ax.spines['bottom'].set_color('#CCCCCC')
+    ax.tick_params(axis='both', labelsize=8.5, colors='#444')
+    ax.grid(True, axis='y', linestyle=':', linewidth=0.6, alpha=0.6)
+    ax.set_axisbelow(True)
+
+    # Give the annotations headroom
+    ax.set_ylim(0, max(series) * 1.22)
+
+    plt.tight_layout(pad=1.2)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
+    plt.close(fig)
+    return buf.getvalue()
 
 
 def build_sales_comparison(history, current_metrics):
@@ -379,7 +473,7 @@ def parse_metrics_from_results(df):
     return metrics
 
 
-def generate_sales_report(df, history=None):
+def generate_sales_report(df, daily_df=None, history=None):
     """Use LLM to analyze the sales data and produce an executive report."""
     print("Generating Sales Report with LLM...")
 
@@ -389,6 +483,15 @@ def generate_sales_report(df, history=None):
     summary_text = df.to_string(index=False)
     current_metrics = parse_metrics_from_results(df)
     hist_comparison = build_sales_comparison(history or [], current_metrics)
+
+    # Daily breakdown inside the week — deterministic, pass verbatim to LLM
+    if daily_df is not None and not daily_df.empty:
+        daily_block = (
+            "--- DAILY BREAKDOWN (TARGET WEEK) ---\n"
+            f"{daily_df.to_string(index=False)}\n"
+        )
+    else:
+        daily_block = ""
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -400,6 +503,8 @@ DATA:
 {summary_text}
 
 {hist_comparison}
+
+{daily_block}
 
 --------------------------------------------------
 
@@ -430,14 +535,21 @@ Then a single <p><b>Sales Insight:</b> …</p> — one bold sentence assessing t
   - Average order value trend
   - Discount impact (total discounts as % of gross sales)
 
-<h3>4. Trends & Outlook</h3>
+<h3>4. Daily Breakdown (What Drove the Week)</h3>
+Use the DAILY BREAKDOWN block verbatim — these are deterministic, not your inference.
+Render an HTML table: Day | Gross Sales (DC-1) | Orders.
+Then a one-sentence call-out naming the day(s) that drove the week (best day + worst day) and whether
+the pattern looks like a weekday-skewed week, a weekend-skewed week, or a single-day spike.
+If the DAILY BREAKDOWN block is empty, write "Daily data unavailable this week."
+
+<h3>5. Trends & Outlook</h3>
 If historical data is provided:
   - Is revenue trending up or down over the last 4 weeks?
   - Are kids sales accelerating or decelerating?
   - Any notable patterns or seasonality signals?
 If no historical data, note this is the first week and trends will appear in future reports.
 
-<h3>5. Key Takeaway</h3>
+<h3>6. Key Takeaway</h3>
 2-3 bullet points: the single most important insight, one risk to watch, one opportunity.
 
 FORMAT RULES:
@@ -474,8 +586,8 @@ def main():
         print("Error: REPORT_RECIPIENT not set.")
         return
 
-    # 1. Fetch data from Snowflake
-    df = fetch_sales_data()
+    # 1. Fetch data from Snowflake (weekly summary + daily breakdown)
+    df, daily_df = fetch_sales_data()
     if df.empty:
         print("No data or error in query.")
         return
@@ -483,24 +595,36 @@ def main():
     # 2. Load history and generate report
     history = load_history("sales")
     week_monday = get_week_monday()
-    report_html, metrics = generate_sales_report(df, history=history)
+    report_html, metrics = generate_sales_report(df, daily_df=daily_df, history=history)
 
     # 3. Save snapshot for future comparisons
     if metrics:
         save_weekly_snapshot("sales", week_monday, metrics)
 
-    # 4. Build attachments
+    # 4. Build attachments — embed the 8-week sparkline above the HTML body
     date_str = week_monday.isoformat()
 
-    docx_bytes = html_to_docx(report_html, "Weekly Sales Summary", date_str)
+    sparkline_png = generate_revenue_sparkline(history, metrics)
+    chart_images = [sparkline_png] if sparkline_png else []
+
+    docx_bytes = html_to_docx(
+        report_html, "Weekly Sales Summary", date_str,
+        chart_images=chart_images,
+    )
 
     csv_io = io.BytesIO()
     df.to_csv(csv_io, index=False)
+
+    daily_csv_io = io.BytesIO()
+    if daily_df is not None and not daily_df.empty:
+        daily_df.to_csv(daily_csv_io, index=False)
 
     attachments = [
         (f"weekly_sales_report_{date_str}.docx", docx_bytes),
         ("sales_summary.csv", csv_io.getvalue()),
     ]
+    if daily_csv_io.getvalue():
+        attachments.append(("sales_daily_breakdown.csv", daily_csv_io.getvalue()))
 
     # 5. Send
     send_report_email(

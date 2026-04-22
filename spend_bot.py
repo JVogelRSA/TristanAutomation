@@ -1,5 +1,6 @@
 import os
 import io
+import re
 from datetime import datetime, timedelta
 import pandas as pd
 from anthropic import Anthropic
@@ -26,8 +27,113 @@ BREX_API_KEY = os.getenv("BREX_API_KEY")
 MERCURY_API_KEY = os.getenv("MERCURY_API_KEY")
 RIPPLING_API_KEY = os.getenv("RIPPLING_API_KEY")
 
+# Optional: current cash on hand, used for runway calc. Set in .env / GH secrets.
+CASH_BALANCE_USD = os.getenv("CASH_BALANCE_USD")
+
+
 def format_currency(x):
     return "${:,.2f}".format(x)
+
+
+def _normalize_vendor(desc: str) -> str:
+    """
+    Collapse a raw transaction description into a stable vendor key so we can
+    group recurring charges across weeks (e.g. "AWS *A1B2C3" and "AWS *D4E5F6"
+    both become "AWS").
+    """
+    if not isinstance(desc, str):
+        return ''
+    # Drop star-suffixed transaction IDs ("VENDOR *abc123") and long alnum tails
+    d = re.sub(r'\s*\*[\w-]+$', '', desc.strip())
+    # Drop trailing trailing digits / dates
+    d = re.sub(r'[\s#]+\d{3,}$', '', d)
+    # Collapse whitespace, strip punctuation noise
+    d = re.sub(r'\s+', ' ', d).strip().upper()
+    # Keep first 3 tokens max — vendor is usually the head of the description
+    return ' '.join(d.split(' ')[:3])
+
+
+def detect_recurring_subscriptions(full_df: pd.DataFrame, min_hits: int = 2) -> pd.DataFrame:
+    """
+    Identify likely recurring subscriptions in the 30-day transaction window.
+    Signals:
+      - Same normalized vendor charged ≥ min_hits times
+      - Charge amounts within 10% of median (stable pricing)
+      - Gap between charges between 25 and 35 days (monthly) OR 6-8 days (weekly)
+    Returns a DataFrame: Vendor | Occurrences | Median Amount | Avg Gap (days) | Cadence | Total 30d
+    """
+    if full_df.empty:
+        return pd.DataFrame()
+    df = full_df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+    df['_vendor_key'] = df['Description'].apply(_normalize_vendor)
+    df = df[df['_vendor_key'] != '']
+
+    rows = []
+    for vendor, g in df.groupby('_vendor_key'):
+        if len(g) < min_hits:
+            continue
+        g = g.sort_values('Date')
+        amounts = g['Amount'].tolist()
+        median_amt = float(pd.Series(amounts).median())
+        if median_amt <= 0:
+            continue
+        # Stable pricing check
+        spread = max(amounts) - min(amounts)
+        if median_amt > 0 and spread / median_amt > 0.3:
+            # Amounts vary too much — probably not a subscription
+            continue
+        gaps = g['Date'].diff().dt.days.dropna().tolist()
+        avg_gap = sum(gaps) / len(gaps) if gaps else 0
+
+        if 6 <= avg_gap <= 8:
+            cadence = 'weekly'
+        elif 13 <= avg_gap <= 16:
+            cadence = 'biweekly'
+        elif 25 <= avg_gap <= 35:
+            cadence = 'monthly'
+        elif 85 <= avg_gap <= 95:
+            cadence = 'quarterly'
+        else:
+            # Irregular — include but mark as such
+            cadence = 'irregular'
+
+        rows.append({
+            'Vendor': vendor.title(),
+            'Occurrences': len(g),
+            'Median Amount': round(median_amt, 2),
+            'Avg Gap (days)': round(avg_gap, 1),
+            'Cadence': cadence,
+            'Total 30d': round(g['Amount'].sum(), 2),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values('Total 30d', ascending=False)
+
+
+def compute_runway(cash_balance: float, history: list, curr_weekly_spend: float) -> dict:
+    """
+    Compute weeks of cash runway at the rolling 4-week burn average.
+    Returns a dict with: cash_balance, weekly_burn, weeks_remaining, runout_date.
+    If cash_balance is None/0, returns an empty dict.
+    """
+    if not cash_balance or cash_balance <= 0:
+        return {}
+    recent = [h['total_spend'] for h in (history or [])[-4:] if 'total_spend' in h]
+    recent.append(curr_weekly_spend)
+    burn = sum(recent) / len(recent) if recent else curr_weekly_spend
+    if burn <= 0:
+        return {}
+    weeks = cash_balance / burn
+    runout = datetime.now() + timedelta(days=int(round(weeks * 7)))
+    return {
+        'cash_balance': round(cash_balance, 2),
+        'weekly_burn': round(burn, 2),
+        'weeks_remaining': round(weeks, 1),
+        'runout_date': runout.strftime('%Y-%m-%d'),
+    }
 
 def generate_spend_report(df, history=None):
     """
@@ -59,9 +165,42 @@ def generate_spend_report(df, history=None):
         trend = f"{'+' if pct_change > 0 else ''}{pct_change:.1f}% vs Last Week ({format_currency(prev_total)})"
     
     top_vendors = curr_df.groupby('Description')['Amount'].sum().sort_values(ascending=False).head(10)
-    
+
     # Build historical comparison if we have past data
     hist_comparison = build_spend_comparison(history or [], curr_total, most_recent_monday)
+
+    # --- Runway (cash-on-hand / rolling burn) -------------------
+    try:
+        cash_balance = float(CASH_BALANCE_USD) if CASH_BALANCE_USD else 0.0
+    except ValueError:
+        cash_balance = 0.0
+    runway = compute_runway(cash_balance, history, curr_total)
+    runway_block = ""
+    if runway:
+        runway_block = (
+            "--- CASH RUNWAY ---\n"
+            f"Cash on hand: ${runway['cash_balance']:,.2f}\n"
+            f"Rolling weekly burn (last 5 wks incl this one): ${runway['weekly_burn']:,.2f}\n"
+            f"Weeks of runway: {runway['weeks_remaining']}\n"
+            f"Projected runout at current burn: {runway['runout_date']}\n"
+        )
+    else:
+        runway_block = (
+            "--- CASH RUNWAY ---\n"
+            "CASH_BALANCE_USD not configured — set it in .env or GitHub secrets "
+            "to enable runway calculation.\n"
+        )
+
+    # --- Recurring-subscription detector ------------------------
+    # Use the full 30-day window (df), not just the current 7 days
+    subs_df = detect_recurring_subscriptions(df)
+    if not subs_df.empty:
+        subs_block = (
+            "--- RECURRING SUBSCRIPTIONS DETECTED (30-day window) ---\n"
+            f"{subs_df.to_string(index=False)}\n"
+        )
+    else:
+        subs_block = "--- RECURRING SUBSCRIPTIONS DETECTED ---\nNone detected in last 30 days.\n"
 
     summary_text = f"""
     --- SPEND DATA ({curr_week_start.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}) ---
@@ -75,6 +214,10 @@ def generate_spend_report(df, history=None):
     {curr_df.sort_values(by='Amount', ascending=False).head(50).to_string(index=False)}
 
     {hist_comparison}
+
+    {runway_block}
+
+    {subs_block}
     """
     
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -102,27 +245,43 @@ Present the following as a compact 2-column summary table (Metric | Value):
   - Rolling 4-week average (if historical data available)
   - Largest single transaction
   - Number of transactions
+  - Cash runway (weeks) — use the CASH RUNWAY block verbatim if present; otherwise write "Not configured — set CASH_BALANCE_USD"
 Then add a single <p><b>CFO Insight:</b> …</p> — one bold sentence assessing spend health and flagging the most important issue or opportunity.
 
-<h3>2. Spend by Category</h3>
+<h3>2. Cash Runway</h3>
+If the CASH RUNWAY block above has numbers, render them as a table:
+  Cash on hand | Rolling weekly burn | Weeks remaining | Projected runout date.
+Then a single sentence: "At current burn the company runs out of cash on {{runout}}, which is {{weeks}} weeks away."
+Apply inline style background-color:#FFE0DC if weeks remaining &lt; 26, #FFF3CC if 26–52, #D5F5E3 if &gt; 52.
+If runway is not configured, write "Runway not available — set CASH_BALANCE_USD in environment."
+
+<h3>3. Recurring Subscriptions</h3>
+Use the RECURRING SUBSCRIPTIONS DETECTED block verbatim — these are deterministic, not your inference.
+Render an HTML table: Vendor | Cadence | Median Amount | Occurrences | Total 30d.
+Sort by Total 30d descending.
+Below the table, in one or two bullet points flag any subscription that looks redundant, unusually large, or is likely to be unused given the business context.
+If the block says "None detected", write "No recurring subscription patterns detected in the last 30 days."
+
+<h3>4. Spend by Category</h3>
 HTML table: Category | Total Spend | % of Week | Txn Count.
 Sort highest to lowest. Apply inline style background-color:#FFE0DC on any category that is unexpectedly high or anomalous.
 Every dollar of spend must appear in exactly one category. End with a "Total" footer row.
 
-<h3>3. Top 10 Vendors</h3>
+<h3>5. Top 10 Vendors</h3>
 HTML table: Vendor | Category | Total Spend | Txn Count | Avg Txn Size.
 Sorted by Total Spend descending. Bold the vendor name in each row.
 
-<h3>4. Anomalies & Items for Review</h3>
+<h3>6. Anomalies & Items for Review</h3>
 List every transaction over $1,000 in a table: Date | Vendor | Amount | Category | Note.
 Also flag any apparent duplicates (same vendor + same amount within the week) or unusual spend spikes.
 If nothing warrants flagging, write "No anomalies detected this week."
 
-<h3>5. Cost Savings & Optimisation</h3>
+<h3>7. Cost Savings & Optimisation</h3>
 2–3 specific, actionable bullet points based on actual vendor patterns in this data.
 Name the vendor or category. Quantify the opportunity where possible. No generic advice.
+Prefer picking from the Recurring Subscriptions table when relevant.
 
-<h3>6. Full Transaction Log (Top 20 by Amount)</h3>
+<h3>8. Full Transaction Log (Top 20 by Amount)</h3>
 HTML table: Date | Vendor | Amount | Category.
 Apply inline style background-color:#FFF3CC on rows with Amount >= $1,000.
 
@@ -153,6 +312,8 @@ FORMAT RULES:
             "transaction_count": len(curr_df),
             "top_vendors": {k: round(v, 2) for k, v in top_vendors.head(5).items()},
             "by_source": {k: round(v, 2) for k, v in curr_df.groupby('Source')['Amount'].sum().items()} if 'Source' in curr_df.columns else {},
+            "runway": runway,  # dict with cash_balance, weekly_burn, weeks_remaining, runout_date (or {})
+            "subscriptions": subs_df.to_dict(orient='records') if not subs_df.empty else [],
         }
         return report_html, curr_df, snapshot
     except Exception as e:

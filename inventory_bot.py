@@ -1,6 +1,6 @@
 import os
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
@@ -114,6 +114,72 @@ TOP_PRIORITY_SKUS = ['1', '401', '400', '28', '29', '31', '36', '37']
 EXCLUDED_SKUS = [
     '3-36', '3-37', '34-', '34-1', '35-', '36-', '37-', '4-3-1', '7'
 ]
+
+# Default lead time (weeks) from PO → stock-on-hand for reorder decisions.
+# Override per-SKU below; anything without an override uses DEFAULT_LEAD_TIME_WEEKS.
+DEFAULT_LEAD_TIME_WEEKS = 10
+LEAD_TIME_WEEKS = {
+    '1': 12,      # DC-1 – long factory lead
+    '6': 12,
+    '6-k': 12,
+    '400': 12,
+    '401': 12,
+    '28': 6,      # Sleeves / accessories
+    '29': 4,
+    '31': 6,
+    '36': 6,
+    '37': 6,
+    '303': 14,    # Seasonal bundle
+}
+
+
+def _lead_time(sku: str) -> int:
+    return LEAD_TIME_WEEKS.get(sku, DEFAULT_LEAD_TIME_WEEKS)
+
+
+def _compute_stockout_and_reorder(stock: float, weekly_burn: float, sku: str, today: datetime):
+    """
+    Given current stock + burn rate, return:
+      - stockout_date (date): when stock hits zero at current burn, or None
+      - weeks_of_runway (float or inf)
+      - reorder_flag (str): one of OVERDUE | THIS WEEK | SOON | OK
+    """
+    if weekly_burn <= 0 or stock <= 0:
+        return None, float('inf'), 'OK'
+
+    weeks_of_runway = stock / weekly_burn
+    stockout_date = today + timedelta(days=int(round(weeks_of_runway * 7)))
+
+    lead = _lead_time(sku)
+    # Time between "runway" and "lead time" is your reorder buffer
+    buffer_weeks = weeks_of_runway - lead
+    if buffer_weeks < 0:
+        flag = 'OVERDUE'
+    elif buffer_weeks < 1:
+        flag = 'THIS WEEK'
+    elif buffer_weeks < 4:
+        flag = 'SOON'
+    else:
+        flag = 'OK'
+    return stockout_date, weeks_of_runway, flag
+
+
+def _compute_velocity_change(sku: str, curr_burn: float, history: list) -> str:
+    """
+    Week-over-week burn rate change for a SKU. Returns e.g. '+42%' or '-18%'.
+    '—' if no prior data.
+    """
+    if not history:
+        return '—'
+    last = history[-1] if isinstance(history, list) else None
+    if not last:
+        return '—'
+    prev = last.get('skus', {}).get(sku, {}).get('burn_rate')
+    if prev is None or prev == 0:
+        return '—' if prev is None else '+new'
+    pct = ((curr_burn - prev) / prev) * 100
+    sign = '+' if pct > 0 else ''
+    return f"{sign}{pct:.0f}%"
 
 def generate_runway_chart(summary_df: pd.DataFrame) -> bytes | None:
     """
@@ -276,21 +342,33 @@ def generate_llm_report(dfs_data, history=None):
                 total_burn += drop # Only count drops (sales), ignore restocks
                 
         avg_weekly_burn = total_burn / weeks_evaluated
-        
-        runway = (curr_qty / avg_weekly_burn) if avg_weekly_burn > 0 else float('inf')
+
+        # Deterministic stockout ETA + reorder flag (don't rely on LLM inference)
+        today = datetime.now()
+        stockout_date, runway, reorder_flag = _compute_stockout_and_reorder(
+            curr_qty, avg_weekly_burn, sku, today
+        )
         runway_str = f"{runway:.1f} weeks" if runway != float('inf') else "N/A"
-        
+        stockout_str = stockout_date.strftime('%Y-%m-%d') if stockout_date else 'N/A'
+
+        # Velocity change vs last week's snapshot
+        velocity_str = _compute_velocity_change(sku, avg_weekly_burn, history or [])
+
         # Mapping Names and Priority
-        product_name = SKU_MAP.get(sku, sku) 
+        product_name = SKU_MAP.get(sku, sku)
         is_top = "Yes" if sku in TOP_PRIORITY_SKUS else "No"
-        
+
         summary_data.append({
             'SKU': sku,
             'Product': product_name,
             'Top 10': is_top,
             'Current Stock': curr_qty,
             'Avg Wkly Burn': round(avg_weekly_burn, 1),
-            'Runway (Est)': runway_str
+            'Runway (Est)': runway_str,
+            'Stockout ETA': stockout_str,
+            'Lead Time (wks)': _lead_time(sku),
+            'Reorder': reorder_flag,
+            'WoW Velocity': velocity_str,
         })
         
     # Inject any explicitly mapped SKUs that were completely missing from the latest CSV
@@ -304,7 +382,11 @@ def generate_llm_report(dfs_data, history=None):
                 'Top 10': is_top,
                 'Current Stock': 0,
                 'Avg Wkly Burn': 0.0,
-                'Runway (Est)': 'N/A'
+                'Runway (Est)': 'N/A',
+                'Stockout ETA': 'N/A',
+                'Lead Time (wks)': _lead_time(missing_sku),
+                'Reorder': 'OK',
+                'WoW Velocity': '—',
             })
             
     summary_df = pd.DataFrame(summary_data)
@@ -343,7 +425,15 @@ def generate_llm_report(dfs_data, history=None):
 
     prompt = f"""
 You are a Senior Supply Chain Analyst at a high-growth hardware company.
-Analyze the inventory data below. "Avg Wkly Burn" = average units sold per week over the past month.
+Analyze the inventory data below.
+ - "Avg Wkly Burn" = average units sold per week over the past month.
+ - "Stockout ETA" = deterministic date stock hits zero at current burn (already computed).
+ - "Lead Time (wks)" = factory-to-warehouse time for that SKU (already computed).
+ - "Reorder" = deterministic flag: OVERDUE / THIS WEEK / SOON / OK based on runway vs lead time.
+ - "WoW Velocity" = week-over-week burn rate change (+% / -% / — if no prior data).
+
+You MUST trust the Stockout ETA, Lead Time and Reorder columns — they are pre-computed, not your inference.
+Use them directly in the tables below.
 
 DATA SUMMARY:
 {summary_text}
@@ -357,31 +447,35 @@ Start directly with the first <h3> tag.
 REQUIRED SECTIONS:
 
 <h3>1. Actions Required ({date_start} – {date_end})</h3>
-Write 2–4 concise bullet points (<ul><li>…</li></ul>) summarising the most important actions the team must take this week.
-Be specific: name products, quantities, and urgency. If a Top Priority item has fewer than 6 weeks runway, demand immediate reorder. This section should be scannable in 10 seconds.
+Write 2–4 concise bullet points (<ul><li>…</li></ul>) covering ONLY items with Reorder flag = OVERDUE or THIS WEEK.
+For each: name the product, the stockout date, the lead time, and the exact action ("Place PO this week for SKU X — stockout ETA YYYY-MM-DD, lead time N weeks").
+If nothing is OVERDUE or THIS WEEK, write a single bullet saying "No immediate reorder actions — next PO window: [earliest SOON item]."
 
-<h3>2. Top Priority Items Snapshot</h3>
+<h3>2. Reorder Priority Queue</h3>
+HTML table of every SKU with Reorder flag ≠ OK, sorted so OVERDUE appears first, then THIS WEEK, then SOON.
+Columns: SKU | Product | Stock | Wkly Burn | Stockout ETA | Lead Time | Reorder | WoW Velocity.
+Apply inline style background-color:#FFE0DC on OVERDUE rows, #FFF3CC on THIS WEEK rows, #FDF6E3 on SOON rows.
+If empty, write "No reorder actions required this week."
+
+<h3>3. Top Priority Items Snapshot</h3>
 Include only items where "Top 10" = "Yes".
-Render an HTML table with columns: SKU | Product | Current Stock | Avg Wkly Burn | Est. Runway | Status.
-In the Status column write "CRITICAL – reorder now" for runway < 4 weeks, "Low – prepare PO" for 4–8 weeks, "Healthy" for > 8 weeks.
-Add a <td style="background-color:#FFE0DC;"> inline style on any CRITICAL row's cells.
-Below the table, add a short paragraph (<p>) with a plain-English sentence for each critical item explaining the sell-out date and required action.
+HTML table: SKU | Product | Current Stock | Avg Wkly Burn | Stockout ETA | Reorder | WoW Velocity.
+Add background-color:#FFE0DC on any OVERDUE or THIS WEEK row.
 
-<h3>3. Burn Rate & Velocity</h3>
-Name the top 3 fastest-moving SKUs with their burn rates.
-If historical trend data is available, note any SKUs where burn has accelerated or decelerated by more than 15%, and any stock that has dropped sharply vs four weeks ago.
-Keep this section to 4–6 bullet points.
+<h3>4. Velocity Movers (WoW)</h3>
+List up to 5 SKUs with the largest absolute WoW Velocity change (ignore '—' and '+new').
+Format: <ul><li><b>Product</b>: burn {{old}} → {{new}} units/wk ({{+/-X%}}) — one-sentence implication</li></ul>.
+If fewer than 3 meaningful movers, note it and move on.
 
-<h3>4. Restock Alerts</h3>
-List all items (Top Priority or otherwise) in the Red Zone (< 4 weeks runway) and Caution Zone (4–8 weeks runway).
-Use a compact 2-column table: Product | Estimated Runway. Apply inline style background-color:#FFE0DC for Red Zone rows, #FFF3CC for Caution Zone rows.
-If nothing falls in a zone, write "None at this time."
+<h3>5. Dead Stock & Capital Tied Up</h3>
+List up to 5 SKUs with Runway > 52 weeks AND Current Stock > 100 units. For each show: Product, Stock, Burn, Runway.
+These are candidates for discount/bundle/liquidation. If none, write "None flagged."
 
-<h3>5. Full Inventory Data Table</h3>
-HTML table with ALL items sorted highest burn rate first: SKU | Product | Current Stock | Avg Wkly Burn | Est. Runway.
-Apply inline styles: background-color:#FFE0DC on rows with runway < 4 weeks; background-color:#FFF3CC on rows with runway 4–8 weeks; background-color:#D5F5E3 on rows with runway > 8 weeks and burn > 0.
+<h3>6. Full Inventory Data Table</h3>
+HTML table with ALL items sorted highest burn rate first: SKU | Product | Current Stock | Avg Wkly Burn | Stockout ETA | Reorder.
+Apply inline styles: background-color:#FFE0DC on OVERDUE/THIS WEEK rows; background-color:#FFF3CC on SOON rows; background-color:#D5F5E3 on OK rows with burn > 0.
 
-<p><i>Methodology: Avg Weekly Burn is a {weeks_evaluated}-week moving average of actual stock depletion, counting only weeks with positive drawdown.</i></p>
+<p><i>Methodology: Avg Weekly Burn is a {weeks_evaluated}-week moving average of actual stock depletion, counting only weeks with positive drawdown. Stockout ETA, Lead Time and Reorder flags are deterministic (not LLM-inferred). Per-SKU lead times can be overridden in inventory_bot.py.</i></p>
 
 FORMAT RULES:
 - Valid HTML only. No markdown. No ** bold syntax — use <b> tags.
