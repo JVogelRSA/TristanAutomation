@@ -79,8 +79,9 @@ def fetch_brex_transactions(api_key, days_back=30):
             if raw_amt <= 0:
                 continue # Skip payments/credits
             amt_val = raw_amt / 100.0
-        except ValueError:
-            amt_val = 0.0
+        except (ValueError, TypeError):
+            # amount may be missing (None) — skip the row instead of zeroing it
+            continue
             
         normalized_data.append({
             "Date": date,

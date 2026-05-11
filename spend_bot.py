@@ -45,7 +45,7 @@ def _normalize_vendor(desc: str) -> str:
         return ''
     # Drop star-suffixed transaction IDs ("VENDOR *abc123") and long alnum tails
     d = re.sub(r'\s*\*[\w-]+$', '', desc.strip())
-    # Drop trailing trailing digits / dates
+    # Drop trailing digits / dates
     d = re.sub(r'[\s#]+\d{3,}$', '', d)
     # Collapse whitespace, strip punctuation noise
     d = re.sub(r'\s+', ' ', d).strip().upper()

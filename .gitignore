@@ -1,10 +1,13 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
 venv/
+.venv/
 .DS_Store
 data/spend/week_*.json
 data/inventory/week_*.json
 data/sales/week_*.json
 scratch/
 /tmp_*
+*.log

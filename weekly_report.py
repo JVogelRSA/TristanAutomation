@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import io
 import os
-from datetime import timedelta
 
 import pandas as pd
 from dotenv import load_dotenv
