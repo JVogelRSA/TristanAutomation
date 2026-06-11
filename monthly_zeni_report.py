@@ -17,8 +17,8 @@ Today" flow reports each evening. This script:
      month-end using the daily flow reports: month-end = snapshot
      + units shipped in between - units received in between.
   3. Counts finished units: DC-1 family (SKUs 1, 6, 6-k) + Kids (SKU 7),
-     and values them at UNIT_VALUE_USD (default $710 - our average net
-     realized revenue per unit).
+     valued at retail price per product (DC1_VALUE_USD, default $729;
+     KIDS_VALUE_USD, default $799).
   4. Emails Zeni a short summary with the source CSV attached.
 
 Scheduling: the GitHub Actions workflow runs daily on the 1st-7th of each
@@ -70,10 +70,10 @@ REPORT_RECIPIENT = os.getenv("REPORT_RECIPIENT")  # fallback / preview
 DC1_SKUS = {"1", "6", "6-k"}
 KIDS_SKUS = {"7"}
 
-# Valuation per unit. Default = average net realized revenue per unit
-# (~$710 after discounts, excluding pass-through tax/shipping), from the
-# monthly dashboard. Override with the UNIT_VALUE_USD env var.
-UNIT_VALUE = float(os.getenv("UNIT_VALUE_USD", "710"))
+# Valuation per unit: retail list price per product.
+# Override with the DC1_VALUE_USD / KIDS_VALUE_USD env vars.
+DC1_VALUE = float(os.getenv("DC1_VALUE_USD", "729"))
+KIDS_VALUE = float(os.getenv("KIDS_VALUE_USD", "799"))
 
 
 def fetch_snapshots(limit=10):
@@ -266,7 +266,9 @@ def main():
             print(f"Daily flows incomplete ({have_ship}/{n_days} shipped, {have_recv}/{n_days} received) - using snapshot as-is.")
 
     total = dc1 + kids
-    dc1_val, kids_val, total_val = dc1 * UNIT_VALUE, kids * UNIT_VALUE, (dc1 + kids) * UNIT_VALUE
+    dc1_val = dc1 * DC1_VALUE
+    kids_val = kids * KIDS_VALUE
+    total_val = dc1_val + kids_val
     print(f"Fully assembled units: {total} (DC-1 {dc1} + Kids {kids}) ~ ${total_val:,.0f}")
 
     if args.dry_run:
@@ -313,10 +315,9 @@ def main():
         Source: DCL "Items Status" inventory report dated {snap_date}
         (attached). {adj_note} Counts new finished devices only - excludes
         open-box returns, accessories, components, and any units held at
-        our office. Value = units &times; ${UNIT_VALUE:,.0f}, our average
-        net realized revenue per unit (after discounts, excluding
-        pass-through tax/shipping) - let us know if you'd prefer a cost
-        basis instead.
+        our office. Value = units &times; retail price (${DC1_VALUE:,.0f}
+        per DC-1, ${KIDS_VALUE:,.0f} per Kids DC-1) - let us know if you'd
+        prefer a cost basis instead.
       </p>
       {stale_note}
       <p>This report is generated automatically on the first DCL inventory
@@ -332,8 +333,8 @@ def main():
         f"  TOTAL:              {total:,}  (${total_val:,.0f})\n\n"
         f"Source: DCL Items Status report dated {snap_date} (attached). {adj_note}\n"
         f"New finished devices only - excludes open-box returns, accessories,\n"
-        f"components, and office units. Value = units x ${UNIT_VALUE:,.0f} (avg net\n"
-        f"realized revenue per unit, after discounts, excl. tax/shipping)."
+        f"components, and office units. Value = units x retail price\n"
+        f"(${DC1_VALUE:,.0f} per DC-1, ${KIDS_VALUE:,.0f} per Kids DC-1)."
     )
 
     send_email(subject, html, text, to_list, cc_list, (fname, payload))
