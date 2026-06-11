@@ -9,3 +9,4 @@ pyarrow==23.0.1
 cryptography==46.0.7
 python-docx==1.2.0
 htmldocx==0.0.6
+openpyxl==3.1.5
