@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -79,7 +80,8 @@ def build_spend_section():
             "snapshot": {},
         }
 
-    history = load_history("spend")
+    # Exclude this week's own snapshot so a re-run doesn't compare against itself
+    history = load_history("spend", exclude_week=get_week_monday())
     report_html, curr_df, snapshot = generate_spend_report(unified_df, history=history)
 
     # Headline for KPI strip
@@ -131,7 +133,7 @@ def build_sales_section():
             "chart_png": None,
         }
 
-    history = load_history("sales")
+    history = load_history("sales", exclude_week=get_week_monday())
     report_html, metrics = generate_sales_report(df, daily_df=daily_df, history=history)
 
     # Look up previous week's revenue for the KPI pct change
@@ -202,7 +204,7 @@ def build_inventory_section():
             "snapshot": {},
         }
 
-    history = load_history("inventory")
+    history = load_history("inventory", exclude_week=get_week_monday())
     report_html, summary_df, snapshot = generate_inventory_report(data, history=history)
 
     # Headline — count of rows with Reorder in {'OVERDUE','THIS WEEK'}
@@ -252,14 +254,15 @@ def build_inventory_section():
 
 
 # ── Top-level orchestrator ────────────────────────────────────────────────
-def main(test_mode: bool = False) -> None:
+def main(test_mode: bool = False, dry_run: bool = False) -> None:
     print("=" * 70)
-    print(f" Weekly unified report · {get_week_monday().isoformat()}")
+    print(f" Weekly unified report · {get_week_monday().isoformat()}"
+          + (" · DRY RUN" if dry_run else ""))
     print("=" * 70)
 
-    if not REPORT_RECIPIENT:
+    if not REPORT_RECIPIENT and not dry_run:
         print("Error: REPORT_RECIPIENT not set.")
-        return
+        sys.exit(1)
 
     week_monday = get_week_monday()
     date_str = week_monday.isoformat()
@@ -283,14 +286,6 @@ def main(test_mode: bool = False) -> None:
         import traceback; traceback.print_exc()
         inventory = {"html": f"<p><b>Inventory section failed:</b> {e}</p>", "headline": {}, "attachments": [], "attachment_names": [], "snapshot": {}}
 
-    # Save snapshots for future runs (only if the section succeeded and has a snapshot)
-    if sales.get("snapshot"):
-        save_weekly_snapshot("sales", week_monday, sales["snapshot"])
-    if spend.get("snapshot"):
-        save_weekly_snapshot("spend", week_monday, spend["snapshot"])
-    if inventory.get("snapshot"):
-        save_weekly_snapshot("inventory", week_monday, inventory["snapshot"])
-
     # Compose the unified HTML + inline images
     html_body, inline_images = compose_weekly_email(
         week_monday=date_str,
@@ -305,6 +300,22 @@ def main(test_mode: bool = False) -> None:
     file_attachments += spend.get("attachments", [])
     file_attachments += inventory.get("attachments", [])
 
+    if dry_run:
+        # Write everything to ./out/ for inspection instead of emailing.
+        # No snapshots are saved either — a dry run leaves no state behind.
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+        os.makedirs(out_dir, exist_ok=True)
+        html_path = os.path.join(out_dir, f"weekly_report_{date_str}.html")
+        with open(html_path, "w") as f:
+            f.write(html_body)
+        for fname, data in file_attachments:
+            with open(os.path.join(out_dir, fname), "wb") as f:
+                f.write(data)
+        print(f"\nDry run complete — no email sent, no snapshots saved.")
+        print(f"  Report: {html_path}")
+        print(f"  Attachments ({len(file_attachments)}): {out_dir}/")
+        return
+
     # Plaintext fallback (very short — the HTML is the experience)
     plain = (
         f"Daylight Weekly Report — Week of {date_str}\n\n"
@@ -317,7 +328,7 @@ def main(test_mode: bool = False) -> None:
     subject_prefix = "[TEST] " if test_mode else ""
     subject = f"{subject_prefix}Daylight Weekly Report — {date_str}"
 
-    send_unified_email(
+    sent = send_unified_email(
         subject=subject,
         html_body=html_body,
         plain_fallback=plain,
@@ -325,8 +336,25 @@ def main(test_mode: bool = False) -> None:
         file_attachments=file_attachments,
         inline_images=inline_images,
     )
+    if not sent:
+        print("Email was not sent — snapshots NOT saved, exiting non-zero.")
+        sys.exit(1)
+
+    # Save snapshots only after the email actually went out, so a failed
+    # send doesn't leave this week's history written as if it succeeded.
+    if sales.get("snapshot"):
+        save_weekly_snapshot("sales", week_monday, sales["snapshot"])
+    if spend.get("snapshot"):
+        save_weekly_snapshot("spend", week_monday, spend["snapshot"])
+    if inventory.get("snapshot"):
+        save_weekly_snapshot("inventory", week_monday, inventory["snapshot"])
 
 
 if __name__ == "__main__":
-    import sys
-    main(test_mode="--test" in sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser(description="Unified weekly report (sales + spend + inventory)")
+    parser.add_argument("--test", action="store_true", help="prefix the subject with [TEST]")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build the full report and write it to ./out/ instead of emailing; saves no snapshots")
+    args = parser.parse_args()
+    main(test_mode=args.test, dry_run=args.dry_run)

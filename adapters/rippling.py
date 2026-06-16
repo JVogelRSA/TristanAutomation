@@ -1,9 +1,8 @@
-import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
 
 RIPPLING_API_URL = "https://api.rippling.com/platform/api"
+REQUEST_TIMEOUT = 30  # seconds
 
 def fetch_rippling_expenses(api_key, days_back=30):
     """
@@ -25,7 +24,7 @@ def fetch_rippling_expenses(api_key, days_back=30):
     print(f"Rippling: Fetching expenses...")
     
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if response.status_code == 404:
             print("Rippling: '/expenses' endpoint not found. Please verify correct endpoint in API docs.")
             return pd.DataFrame()

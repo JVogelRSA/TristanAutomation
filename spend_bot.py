@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import sys
 from datetime import datetime, timedelta
 import pandas as pd
 from anthropic import Anthropic
@@ -142,8 +143,13 @@ def generate_spend_report(df, history=None):
     """
     print("Generating Spend Analysis with LLM...")
 
-    # Needs Date column as datetime
-    df['Date'] = pd.to_datetime(df['Date'])
+    # Needs Date column as datetime. Coerce instead of raise: a single
+    # malformed date from an adapter shouldn't kill the whole report.
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    bad_dates = df['Date'].isna().sum()
+    if bad_dates:
+        print(f"Spend: dropping {bad_dates} row(s) with unparseable dates.")
+        df = df.dropna(subset=['Date'])
 
     # Snap to the most recent Monday to ensure consistent Monday-to-Monday reporting
     most_recent_monday = get_week_monday()
@@ -294,16 +300,20 @@ FORMAT RULES:
 """
     
     try:
+        # claude-opus-4-8: same price as 4.6, better analysis. Note: 4.7+
+        # rejects temperature/top_p, and content[0] isn't guaranteed to be
+        # the text block — extract by type.
         response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            temperature=0,
+            model="claude-opus-4-8",
+            max_tokens=8192,
             system="You are an elite, highly analytical Fractional CFO. You identify operational inefficiencies, unnecessary subscriptions, and actionable cost-saving opportunities by deeply analyzing transaction context.",
             messages=[
                 {"role": "user", "content": prompt}
             ]
         )
-        report_html = response.content[0].text
+        report_html = next((b.text for b in response.content if b.type == "text"), "")
+        if not report_html:
+            raise ValueError(f"LLM returned no text content (stop_reason={response.stop_reason})")
 
         # Build snapshot data for persistence
         snapshot = {
@@ -348,14 +358,11 @@ def main():
         print("No data fetched from any source. Check API keys.")
         return
 
-    # 3. Load historical data and analyze
-    history = load_history("spend")
+    # 3. Load historical data and analyze (excluding this week's own snapshot
+    # so a re-run doesn't compare the week against itself)
     week_monday = get_week_monday()
+    history = load_history("spend", exclude_week=week_monday)
     report_html, curr_df, snapshot = generate_spend_report(unified_df, history=history)
-
-    # Save this week's snapshot for future comparisons
-    if snapshot:
-        save_weekly_snapshot("spend", week_monday, snapshot)
 
     # 4. Build attachments
     date_str = week_monday.isoformat()
@@ -376,13 +383,17 @@ def main():
         ("full_30_days_raw.csv", full_csv_io.getvalue()),
     ]
 
-    # 5. Send
-    send_report_email(
+    # 5. Send; save the snapshot only after a successful delivery
+    sent = send_report_email(
         subject=f"Weekly Spend Analysis (Brex) - {date_str}",
         body_text="Your weekly spend report is attached.",
         recipient=REPORT_RECIPIENT,
         attachments=attachments,
     )
+    if not sent:
+        sys.exit(1)
+    if snapshot:
+        save_weekly_snapshot("spend", week_monday, snapshot)
 
 if __name__ == "__main__":
     main()

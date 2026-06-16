@@ -354,7 +354,7 @@ def send_unified_email(
     recipient: str,
     file_attachments: list[tuple[str, bytes]],
     inline_images: list[tuple[str, bytes, str]],
-) -> None:
+) -> bool:
     """
     Send one email with:
       - multipart/mixed root
@@ -362,6 +362,9 @@ def send_unified_email(
           - multipart/alternative (text/plain + text/html)
           - inline image parts (referenced by CID)
         - file attachment parts
+
+    Returns True on success. Returns False for config problems; raises on
+    SMTP failures so the caller's exit code reflects the delivery failure.
     """
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
@@ -370,10 +373,10 @@ def send_unified_email(
 
     if not smtp_username or not smtp_password:
         print("Error: SMTP credentials not configured.")
-        return
+        return False
     if not recipient:
         print("Error: No recipient specified.")
-        return
+        return False
 
     # Root: mixed so file attachments sit alongside the HTML+inline bundle
     root = MIMEMultipart("mixed")
@@ -403,15 +406,16 @@ def send_unified_email(
 
     try:
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port) as s:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=60) as s:
                 s.login(smtp_username, smtp_password)
                 s.send_message(root)
         else:
-            with smtplib.SMTP(smtp_server, smtp_port) as s:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=60) as s:
                 s.starttls()
                 s.login(smtp_username, smtp_password)
                 s.send_message(root)
         print(f"Unified weekly report sent to {recipient}.")
+        return True
     except Exception as e:
         print(f"Error sending unified email: {e}")
         raise

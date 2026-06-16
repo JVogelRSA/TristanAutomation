@@ -119,20 +119,30 @@ def save_weekly_snapshot(bot_name, week_monday, data):
     print(f"Saved snapshot: {filepath.name}")
 
 
-def load_history(bot_name, max_weeks=12):
+def load_history(bot_name, max_weeks=12, exclude_week=None):
     """
     Load all saved weekly snapshots, sorted oldest-first.
     Returns list of dicts. Caps at max_weeks most recent.
+
+    exclude_week: date or 'YYYY-MM-DD' string. Pass the CURRENT reporting week
+    so that re-running a report in the same week doesn't compare this week
+    against its own earlier snapshot (which made every WoW delta read ~0%).
     """
     bot_path = _bot_dir(bot_name)
     files = sorted(bot_path.glob("week_*.json"))
+    exclude_key = None
+    if exclude_week is not None:
+        exclude_key = exclude_week if isinstance(exclude_week, str) else exclude_week.isoformat()
     snapshots = []
     for f in files:
         try:
             with open(f) as fh:
-                snapshots.append(json.load(fh))
+                snap = json.load(fh)
         except (json.JSONDecodeError, IOError):
             continue
+        if exclude_key and snap.get("week_monday") == exclude_key:
+            continue
+        snapshots.append(snap)
     return snapshots[-max_weeks:]
 
 

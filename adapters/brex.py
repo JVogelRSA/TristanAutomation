@@ -1,9 +1,9 @@
-import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 
 BREX_API_URL = "https://platform.brexapis.com/v2"
+REQUEST_TIMEOUT = 30  # seconds — without this a hung connection stalls the whole cron run
 
 def fetch_brex_transactions(api_key, days_back=30):
     """
@@ -34,8 +34,8 @@ def fetch_brex_transactions(api_key, days_back=30):
     
     try:
         while url:
-            response = requests.get(url, headers=headers, params=params)
-            
+            response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+
             if response.status_code != 200:
                 print(f"Brex Error {response.status_code}: {response.text}")
                 break
@@ -61,18 +61,18 @@ def fetch_brex_transactions(api_key, days_back=30):
 
     # Normalization
     normalized_data = []
+    skipped = 0
     for txn in all_txns:
         # Extract fields
-        date = txn.get('posted_at_date') # YYYY-MM-DD
+        date = txn.get('posted_at_date') or (txn.get('initiated_at_date'))  # YYYY-MM-DD
         desc = txn.get('description')
-        amount = txn.get('amount', {}).get('amount')
-        currency = txn.get('amount', {}).get('currency')
-        
+        amount = (txn.get('amount') or {}).get('amount')
+
         # Determine category (Brex provides 'merchant' object with mcc or category)
         category = "Uncategorized"
         if txn.get('merchant'):
             category = txn.get('merchant').get('mcc_description') or category
-            
+
         try:
             raw_amt = float(amount)
             # In Brex, spend is POSITIVE, payments are NEGATIVE
@@ -81,14 +81,23 @@ def fetch_brex_transactions(api_key, days_back=30):
             amt_val = raw_amt / 100.0
         except (ValueError, TypeError):
             # amount may be missing (None) — skip the row instead of zeroing it
+            skipped += 1
             continue
-            
+
+        if not date:
+            # A dateless row can't be bucketed into a reporting week, and a
+            # None date crashes pd.to_datetime downstream — skip it.
+            skipped += 1
+            continue
+
         normalized_data.append({
             "Date": date,
             "Description": desc,
-            "Amount": amt_val, 
+            "Amount": amt_val,
             "Category": category,
             "Source": "Brex"
         })
-        
+
+    if skipped:
+        print(f"Brex: skipped {skipped} transaction(s) with missing amount or date.")
     return pd.DataFrame(normalized_data)

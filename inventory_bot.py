@@ -1,5 +1,6 @@
 import os
 import io
+import sys
 from datetime import datetime, timedelta
 import pandas as pd
 from imap_tools import MailBox, AND
@@ -267,8 +268,14 @@ def generate_llm_report(dfs_data, history=None):
     print("Analyzing comprehensive data and generating report...")
     
     if len(dfs_data) < 2:
+        # Callers unpack three values — returning a bare string here used to
+        # crash them with "too many values to unpack".
         print("Not enough history to calculate burn rate.")
-        return "<p>Error: Not enough historical CSVs found to calculate average burn rate.</p>"
+        return (
+            "<p>Error: Not enough historical CSVs found to calculate average burn rate.</p>",
+            pd.DataFrame(),
+            {},
+        )
 
     # Use the latest DF for the baseline schema
     curr_date, curr_df = dfs_data[-1]
@@ -506,14 +513,10 @@ def main():
 
     print(f"Evaluating data across {len(data)} weeks of history.")
 
-    # Load historical snapshots and generate report
-    history = load_history("inventory")
+    # Load historical snapshots (excluding this week's own) and generate report
     week_monday = get_week_monday()
+    history = load_history("inventory", exclude_week=week_monday)
     report_html, summary_df, snapshot = generate_llm_report(data, history=history)
-
-    # Save this week's snapshot for future comparisons
-    if snapshot:
-        save_weekly_snapshot("inventory", week_monday, snapshot)
 
     print("\n--- REPORT PREVIEW ---\n")
     print(report_html)
@@ -539,12 +542,16 @@ def main():
         df.to_csv(csv_buffer, index=False)
         attachments.append((f"inventory_raw_{date.strftime('%Y%m%d')}.csv", csv_buffer.getvalue()))
 
-    send_report_email(
+    sent = send_report_email(
         subject=f"Weekly Inventory Report - {date_str}",
         body_text="Your weekly inventory report is attached.",
         recipient=REPORT_RECIPIENT,
         attachments=attachments,
     )
+    if not sent:
+        sys.exit(1)
+    if snapshot:
+        save_weekly_snapshot("inventory", week_monday, snapshot)
 
 if __name__ == "__main__":
     main()

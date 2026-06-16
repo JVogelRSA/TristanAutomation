@@ -11,3 +11,12 @@ data/sales/week_*.json
 scratch/
 /tmp_*
 *.log
+
+# Claude Code local config
+.claude/
+
+# Dry-run output
+out/
+
+# Monthly history snapshots
+data/*/month_*.json

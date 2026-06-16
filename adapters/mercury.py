@@ -1,9 +1,9 @@
-import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 
 MERCURY_API_URL = "https://api.mercury.com/api/v1"
+REQUEST_TIMEOUT = 30  # seconds — without this a hung connection stalls the whole cron run
 
 def fetch_mercury_transactions(api_key, days_back=30):
     """
@@ -32,15 +32,15 @@ def fetch_mercury_transactions(api_key, days_back=30):
     all_txns = []
     
     try:
-        response = requests.get(url, headers=headers, params=params)
-        
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+
         if response.status_code != 200:
             print(f"Mercury Error {response.status_code}: {response.text}")
             return pd.DataFrame()
-            
+
         data = response.json()
         all_txns = data.get('transactions', [])
-        
+
     except Exception as e:
         print(f"Mercury Exception: {e}")
         return pd.DataFrame()
@@ -50,25 +50,33 @@ def fetch_mercury_transactions(api_key, days_back=30):
 
     # Normalization
     normalized_data = []
+    skipped = 0
     for txn in all_txns:
         # Extract fields
         # Mercury date is 'postedAt' or 'createdAt'
         date_str = txn.get('postedAt') or txn.get('createdAt')
         date = date_str.split('T')[0] if date_str else ""
-        
+
         desc = txn.get('bankDescription') or txn.get('note') or "Unknown"
-        amount = float(txn.get('amount', 0))
-        
+        try:
+            amount = float(txn.get('amount'))
+        except (ValueError, TypeError):
+            # amount may be missing (None) on pending/failed txns — skip the
+            # row instead of crashing the whole spend section (same treatment
+            # as the Brex adapter)
+            skipped += 1
+            continue
+
         # Mercury kind: 'externalTransfer', 'check', etc.
         kind = txn.get('kind', 'Unknown')
-        
+
         # We only want Money Out (negative amounts in Mercury are outflows)
         if amount >= 0:
             continue # Skip deposits
-            
+
         # Convert to positive for reporting
         spend_amount = abs(amount)
-            
+
         normalized_data.append({
             "Date": date,
             "Description": desc,
@@ -76,5 +84,7 @@ def fetch_mercury_transactions(api_key, days_back=30):
             "Category": kind, # Mercury doesn't have deep categorization, use Kind
             "Source": "Mercury"
         })
-        
+
+    if skipped:
+        print(f"Mercury: skipped {skipped} transaction(s) with missing amounts.")
     return pd.DataFrame(normalized_data)

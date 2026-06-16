@@ -14,18 +14,23 @@ SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
 
+SMTP_TIMEOUT = 60  # seconds — an unset timeout can hang a cron run forever
+
+
 def send_report_email(subject, body_text, recipient, attachments=None):
     """
     Send an email with optional file attachments.
     attachments: list of (filename, bytes_data) tuples
+    Returns True on success, False otherwise — callers should exit non-zero
+    on False so cron/CI can detect delivery failures.
     """
     if not recipient:
         print("No recipient specified.")
-        return
+        return False
 
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         print("Error: SMTP credentials not configured.")
-        return
+        return False
 
     msg = MIMEMultipart()
     msg['Subject'] = subject
@@ -42,14 +47,16 @@ def send_report_email(subject, body_text, recipient, attachments=None):
 
     try:
         if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
                 server.starttls()
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.send_message(msg)
         print(f"Email sent to {recipient}!")
+        return True
     except Exception as e:
         print(f"Error sending email: {e}")
+        return False

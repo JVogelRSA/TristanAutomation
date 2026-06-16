@@ -1,5 +1,6 @@
 import os
 import io
+import sys
 from datetime import datetime, timedelta
 import pandas as pd
 import snowflake.connector
@@ -497,14 +498,18 @@ FORMAT RULES:
 """
 
     try:
+        # claude-opus-4-8: same price as 4.6, better analysis. Note: 4.7+
+        # rejects temperature/top_p, and content[0] isn't guaranteed to be
+        # the text block — extract by type.
         response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            temperature=0,
+            model="claude-opus-4-8",
+            max_tokens=8192,
             system="You are a sharp, data-driven VP of Sales. You focus on actionable insights, revenue trends, and growth opportunities. Be direct and specific — no fluff.",
             messages=[{"role": "user", "content": prompt}]
         )
-        report_html = response.content[0].text
+        report_html = next((b.text for b in response.content if b.type == "text"), "")
+        if not report_html:
+            raise ValueError(f"LLM returned no text content (stop_reason={response.stop_reason})")
         return report_html, current_metrics
     except Exception as e:
         print(f"Error generating LLM report: {e}")
@@ -529,14 +534,10 @@ def main():
         print("No data or error in query.")
         return
 
-    # 2. Load history and generate report
-    history = load_history("sales")
+    # 2. Load history (excluding this week's own snapshot) and generate report
     week_monday = get_week_monday()
+    history = load_history("sales", exclude_week=week_monday)
     report_html, metrics = generate_sales_report(df, daily_df=daily_df, history=history)
-
-    # 3. Save snapshot for future comparisons
-    if metrics:
-        save_weekly_snapshot("sales", week_monday, metrics)
 
     # 4. Build attachments
     date_str = week_monday.isoformat()
@@ -557,13 +558,17 @@ def main():
     if daily_csv_io.getvalue():
         attachments.append(("sales_daily_breakdown.csv", daily_csv_io.getvalue()))
 
-    # 5. Send
-    send_report_email(
+    # 5. Send; save the snapshot only after a successful delivery
+    sent = send_report_email(
         subject=f"Weekly Sales Summary - {date_str}",
         body_text="Your weekly sales report is attached.",
         recipient=REPORT_RECIPIENT,
         attachments=attachments,
     )
+    if not sent:
+        sys.exit(1)
+    if metrics:
+        save_weekly_snapshot("sales", week_monday, metrics)
 
 
 if __name__ == "__main__":

@@ -1,25 +1,25 @@
-name: Monthly Zeni Inventory Report
+name: Monthly Internal Inventory Report
 
 on:
   schedule:
-    # Daily at 15:00 UTC (08:00 PT) on the 1st-7th of each month.
-    # The script only actually sends on the day the first DCL inventory
-    # snapshot of the new month arrives (Mondays, 00:01 PT) - so this
-    # fires exactly once per month and no-ops on the other days.
-    - cron: '0 15 1-7 * *'
+    # Daily at 15:05 UTC (08:05 PT) on the 1st-7th. The script (--monthly)
+    # only sends on the day the first new-month DCL "Items Status" snapshot
+    # arrives, so this fires exactly once per month. Runs 5 min after the
+    # Zeni job to avoid hammering IMAP at the same instant.
+    - cron: '5 15 1-7 * *'
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Force-send using the best available snapshot'
-        type: boolean
-        default: false
       dry_run:
         description: 'Compute and log only (no email)'
         type: boolean
         default: false
+      ignore_monthly_guard:
+        description: 'Send now regardless of snapshot-arrival day'
+        type: boolean
+        default: false
 
 jobs:
-  zeni-report:
+  inventory-report:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
@@ -35,27 +35,24 @@ jobs:
         python -m pip install --upgrade pip
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Run Monthly Zeni Report
+    - name: Run Internal Inventory Report
       env:
         IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
         IMAP_USERNAME: ${{ secrets.IMAP_USERNAME }}
         IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
-        EMAIL_SUBJECT_KEYWORD: ${{ secrets.EMAIL_SUBJECT_KEYWORD }}
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
         SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
-        ZENI_RECIPIENTS: ${{ secrets.ZENI_RECIPIENTS }}
-        ZENI_CC: ${{ secrets.ZENI_CC }}
+        INTERNAL_RECIPIENTS: ${{ secrets.INTERNAL_RECIPIENTS }}
         DC1_VALUE_USD: ${{ secrets.DC1_VALUE_USD }}
         KIDS_VALUE_USD: ${{ secrets.KIDS_VALUE_USD }}
         DC1_COST_USD: ${{ secrets.DC1_COST_USD }}
         KIDS_COST_USD: ${{ secrets.KIDS_COST_USD }}
-        COST_CONFIRMED: ${{ secrets.COST_CONFIRMED }}
       run: |
         FLAGS=""
-        if [ "${{ inputs.force }}" = "true" ]; then FLAGS="$FLAGS --force"; fi
         if [ "${{ inputs.dry_run }}" = "true" ]; then FLAGS="$FLAGS --dry-run"; fi
-        python monthly_zeni_report.py $FLAGS
+        if [ "${{ inputs.ignore_monthly_guard }}" != "true" ]; then FLAGS="$FLAGS --monthly"; fi
+        python inventory_internal_report.py $FLAGS
