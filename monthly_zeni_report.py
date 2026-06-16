@@ -53,7 +53,7 @@ EMAIL_SUBJECT_KEYWORD = os.getenv("EMAIL_SUBJECT_KEYWORD", "Items Status")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER", "reports@notifications.dclcorp.com")
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))  # our Gmail uses 465 (SSL)
+SMTP_PORT = int((os.getenv("SMTP_PORT") or "465").strip() or "465")  # Gmail SSL=465
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
@@ -76,10 +76,20 @@ KIDS_SKUS = {"7"}
 # DC-1 cost ($425) is Anjan's production-cost figure from May 2026 ("what
 # DCL books inventory at"). Kids cost is a placeholder (Kids is a bundle,
 # not separately costed yet) - pending Anjan's confirmation.
-DC1_VALUE = float(os.getenv("DC1_VALUE_USD", "729"))
-KIDS_VALUE = float(os.getenv("KIDS_VALUE_USD", "799"))
-DC1_COST = float(os.getenv("DC1_COST_USD", "425"))
-KIDS_COST = float(os.getenv("KIDS_COST_USD", "425"))
+def _envfloat(name, default):
+    """float() of an env var, tolerant of unset/empty (GitHub passes an
+    undefined secret as an empty string, which would crash float('')."""
+    v = (os.getenv(name) or "").strip()
+    try:
+        return float(v) if v else float(default)
+    except ValueError:
+        return float(default)
+
+
+DC1_VALUE = _envfloat("DC1_VALUE_USD", 729)
+KIDS_VALUE = _envfloat("KIDS_VALUE_USD", 799)
+DC1_COST = _envfloat("DC1_COST_USD", 425)
+KIDS_COST = _envfloat("KIDS_COST_USD", 425)
 # Set to "1" once Anjan has confirmed the cost figures; until then the
 # report watermarks the cost column as provisional.
 COST_CONFIRMED = os.getenv("COST_CONFIRMED", "0") == "1"

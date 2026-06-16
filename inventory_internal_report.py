@@ -35,20 +35,30 @@ IMAP_USERNAME = os.getenv("IMAP_USERNAME")
 IMAP_PASSWORD = os.getenv("IMAP_PASSWORD")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER", "reports@notifications.dclcorp.com")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
+SMTP_PORT = int((os.getenv("SMTP_PORT") or "465").strip() or "465")
 SMTP_USERNAME = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 # Internal report goes to Jesse (he forwards to Anjan). Override via INTERNAL_RECIPIENTS.
-INTERNAL_RECIPIENTS = os.getenv("INTERNAL_RECIPIENTS", os.getenv("REPORT_RECIPIENT", ""))
+INTERNAL_RECIPIENTS = (os.getenv("INTERNAL_RECIPIENTS") or os.getenv("REPORT_RECIPIENT") or "")
 
 DC1_SKUS = {"1", "6", "6-k"}
 KIDS_SKUS = {"7"}
 
+
+def _envfloat(name, default):
+    """float() tolerant of unset/empty env (GitHub passes undefined secrets as '')."""
+    v = (os.getenv(name) or "").strip()
+    try:
+        return float(v) if v else float(default)
+    except ValueError:
+        return float(default)
+
+
 # Retail (list) price and production cost per unit. Env-overridable.
-DC1_RETAIL = float(os.getenv("DC1_VALUE_USD", "729"))
-KIDS_RETAIL = float(os.getenv("KIDS_VALUE_USD", "799"))
-DC1_COST = float(os.getenv("DC1_COST_USD", "425"))     # Anjan, May 2026 (production cost)
-KIDS_COST = float(os.getenv("KIDS_COST_USD", "425"))   # placeholder — Kids cost TBD (bundle)
+DC1_RETAIL = _envfloat("DC1_VALUE_USD", 729)
+KIDS_RETAIL = _envfloat("KIDS_VALUE_USD", 799)
+DC1_COST = _envfloat("DC1_COST_USD", 425)     # Anjan, May 2026 (production cost)
+KIDS_COST = _envfloat("KIDS_COST_USD", 425)   # placeholder — Kids cost TBD (bundle)
 
 
 def date_from_filename(filename, fallback):
