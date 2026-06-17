@@ -54,6 +54,8 @@ jobs:
         DC1_COST_USD: ${{ secrets.DC1_COST_USD }}
         KIDS_COST_USD: ${{ secrets.KIDS_COST_USD }}
         COST_CONFIRMED: ${{ secrets.COST_CONFIRMED }}
+        GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
         FLAGS=""
         if [ "${{ inputs.force }}" = "true" ]; then FLAGS="$FLAGS --force"; fi
