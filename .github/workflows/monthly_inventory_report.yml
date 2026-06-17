@@ -51,6 +51,8 @@ jobs:
         KIDS_VALUE_USD: ${{ secrets.KIDS_VALUE_USD }}
         DC1_COST_USD: ${{ secrets.DC1_COST_USD }}
         KIDS_COST_USD: ${{ secrets.KIDS_COST_USD }}
+        GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       run: |
         FLAGS=""
         if [ "${{ inputs.dry_run }}" = "true" ]; then FLAGS="$FLAGS --dry-run"; fi

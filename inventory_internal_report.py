@@ -1,22 +1,25 @@
 """
-Internal weekly inventory dashboard (for Jesse → Anjan).
+Internal monthly inventory report (for Jesse -> Anjan).
 
-Richer than the Zeni month-end report: current on-hand by product with
-cost + retail value, open-box/returns, what's inbound (open POs), the last
-7 days of shipped/received flow, and weeks-of-cover. Pulls entirely from
-DCL's automated emails — no LLM, deterministic.
+The full picture Anjan wants: DCL **warehouse** finished goods + the **office**
+stock tracked in the "Daylight IMS" Google Sheet, merged into one report —
+new / open-box / warranty by model and location, cost + retail valuation,
+open-box grades, the office warranty-repair queue, accessories, inbound POs,
+trailing flow and weeks-of-cover. Deterministic, no LLM.
+
+Zeni's report (monthly_zeni_report.py) is intentionally warehouse-only; this
+internal one is the superset.
 
 Sources:
-  - "Items Status"        weekly on-hand snapshot (Mondays)
-  - "Items Shipped Today" daily shipments (CSV)
-  - "Items Received Today" daily receipts (XLSX)
+  - DCL "Items Status"  on-hand snapshot (warehouse)            [email]
+  - Daylight IMS sheet, Report tab (office)                     [office_inventory.py]
+  - DCL "Items Shipped/Received Today" daily flow              [email]
 
-Flags: --dry-run (compute + print, don't send).
+Flags: --dry-run (compute + print, don't send); --monthly (fire once/month).
 """
 import os
 import io
 import re
-import sys
 import argparse
 import smtplib
 from datetime import date, datetime, timedelta
@@ -27,6 +30,8 @@ from email.mime.application import MIMEApplication
 import pandas as pd
 from imap_tools import MailBox, AND
 from dotenv import load_dotenv
+
+import office_inventory
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
@@ -58,7 +63,27 @@ def _envfloat(name, default):
 DC1_RETAIL = _envfloat("DC1_VALUE_USD", 729)
 KIDS_RETAIL = _envfloat("KIDS_VALUE_USD", 799)
 DC1_COST = _envfloat("DC1_COST_USD", 425)     # Anjan, May 2026 (production cost)
-KIDS_COST = _envfloat("KIDS_COST_USD", 425)   # placeholder — Kids cost TBD (bundle)
+KIDS_COST = _envfloat("KIDS_COST_USD", 425)   # Kids bundle, same per-unit per Jesse 2026-06-16
+
+# Accessory alignment: office sheet label -> warehouse SKU(s) to sum on-hand.
+WH_ACC = {
+    "Kids Case": ["31"],
+    "Daylight Sling": ["23"],
+    "Comfy Sleeve": ["28"],
+    "Lamy Stylus": ["29"],
+    "Stands": ["34-", "34-1"],
+    "Wood Lamp Fixture": ["40"],
+    "36 - (T45)": ["36-"],
+    "36-1 - (T45 Deep Amber)": ["36-1"],
+    "37 - (ST64)": ["37-"],
+    "37-1 (ST64 Deep Amber)": ["37-1"],
+    "37-2 (ST64 Bright 60W)": ["37-2"],
+    "41 - (G80 Red)": ["41"],
+    "Light Bulbs (All SKUs)": ["36-", "36-1", "37-", "37-1", "37-2", "41"],
+}
+# Warehouse-only accessories worth surfacing (no office row).
+EXTRA_WH_ACC = [("Kids Stylus", ["30"]), ("Keyboard Case", ["32"]),
+                ("Logitech keyboard", ["35-"]), ("Kids Night Light", ["38-"])]
 
 
 def date_from_filename(filename, fallback):
@@ -89,7 +114,7 @@ def _read_attachment(att):
 
 
 def latest_status():
-    """Most recent Items Status snapshot → (date, filename, payload, df)."""
+    """Most recent Items Status snapshot -> (date, filename, payload, df)."""
     with MailBox(IMAP_SERVER).login(IMAP_USERNAME, IMAP_PASSWORD) as mb:
         crit = AND(subject="Items Status", from_=EMAIL_SENDER)
         for m in mb.fetch(crit, reverse=True, mark_seen=False, bulk=True):
@@ -141,6 +166,12 @@ def usd(x):
     return f"${x:,.0f}"
 
 
+def _empty_office():
+    z = {"total": 0, "std": 0, "kids": 0}
+    return {"new": dict(z), "warranty": dict(z), "openbox": dict(z), "total": dict(z),
+            "grades": {}, "queue": {}, "accessories": {}}
+
+
 def build_report():
     snap = latest_status()
     if not snap:
@@ -148,94 +179,201 @@ def build_report():
     snap_date, fname, payload, df = snap
     df["Item #"] = norm_items(df["Item #"])
     oh = pd.to_numeric(df["Q On Hand"], errors="coerce").fillna(0)
-    # df.get with a missing column returns a scalar, which breaks boolean
-    # indexing below - default to a same-length zero Series instead.
     po_col = df["Open PO"] if "Open PO" in df.columns else pd.Series(0, index=df.index)
     po = pd.to_numeric(po_col, errors="coerce").fillna(0)
+    oh_by_item = oh.groupby(df["Item #"]).sum()      # SKU -> on-hand (summed)
 
-    dc1 = int(oh[df["Item #"].isin(DC1_SKUS)].sum())
-    kids = int(oh[df["Item #"].isin(KIDS_SKUS)].sum())
-    openbox = int(oh[df["Item #"].str.startswith("4-") | (df["Item #"] == "2")].sum())
-    total = dc1 + kids
+    def wh_qty(skus):
+        return int(sum(oh_by_item.get(s, 0) for s in skus))
+
+    # --- warehouse finished goods ---
+    wh_new_dc1 = int(oh[df["Item #"].isin(DC1_SKUS)].sum())
+    wh_new_kids = int(oh[df["Item #"].isin(KIDS_SKUS)].sum())
+    wh_openbox = int(oh[df["Item #"].str.startswith("4-") | (df["Item #"] == "2")].sum())  # all DC-1
 
     dc1_po = int(po[df["Item #"].isin(DC1_SKUS)].sum())
     kids_po = int(po[df["Item #"].isin(KIDS_SKUS)].sum())
 
-    # Trailing ~30 days of flow (covers the prior month for a monthly report)
+    # --- office (Daylight IMS) ---
+    office = office_inventory.office_summary()
+    office_ok = office is not None
+    if not office_ok:
+        office = _empty_office()
+
+    # --- combined category x model ---
+    new_dc1 = wh_new_dc1 + office["new"]["std"]
+    new_kids = wh_new_kids + office["new"]["kids"]
+    ob_dc1 = wh_openbox + office["openbox"]["std"]     # warehouse open-box is all DC-1
+    ob_kids = office["openbox"]["kids"]
+    wr_dc1 = office["warranty"]["std"]                 # warehouse warranty folded in open-box
+    wr_kids = office["warranty"]["kids"]
+
+    sellable_dc1, sellable_kids = new_dc1 + ob_dc1, new_kids + ob_kids
+    sellable_units = sellable_dc1 + sellable_kids
+    warranty_units = wr_dc1 + wr_kids
+    census_units = sellable_units + warranty_units
+
+    new_cost = new_dc1 * DC1_COST + new_kids * KIDS_COST
+    new_ret = new_dc1 * DC1_RETAIL + new_kids * KIDS_RETAIL
+    ob_cost = ob_dc1 * DC1_COST + ob_kids * KIDS_COST
+    ob_ret = ob_dc1 * DC1_RETAIL + ob_kids * KIDS_RETAIL
+    sellable_cost = new_cost + ob_cost
+    sellable_ret = new_ret + ob_ret
+
+    wh_units = wh_new_dc1 + wh_new_kids + wh_openbox
+    office_units = office["total"]["total"]
+
+    # --- accessories: warehouse vs office, aligned ---
+    acc_rows = []
+    for label, val in office["accessories"].items():
+        acc_rows.append((label, wh_qty(WH_ACC.get(label, [])), val,
+                         label in WH_ACC))
+    for label, skus in EXTRA_WH_ACC:
+        acc_rows.append((label, wh_qty(skus), None, True))
+
+    # --- trailing ~30 days of flow ---
     end = snap_date - timedelta(days=1)
     start = end - timedelta(days=29)
     flows = daily_flows(start, end)
-    ship7 = flows["ship_dc1"] + flows["ship_kids"]
-    recv7 = flows["recv_dc1"] + flows["recv_kids"]
+    ship30 = flows["ship_dc1"] + flows["ship_kids"]
+    recv30 = flows["recv_dc1"] + flows["recv_kids"]
     flow_avail = bool(flows["ship_days"] or flows["recv_days"])
-    weeks_cover = (total / ship7) if ship7 > 0 else None
+    weeks_cover = (sellable_units / (ship30 / 4.3)) if ship30 > 0 else None
 
     return {
         "snap_date": snap_date, "fname": fname, "payload": payload,
-        "dc1": dc1, "kids": kids, "openbox": openbox, "total": total,
+        "office_ok": office_ok, "office": office,
+        "new": (new_dc1, new_kids), "openbox": (ob_dc1, ob_kids), "warranty": (wr_dc1, wr_kids),
+        "new_cost": new_cost, "new_ret": new_ret, "ob_cost": ob_cost, "ob_ret": ob_ret,
+        "sellable": (sellable_dc1, sellable_kids), "sellable_units": sellable_units,
+        "sellable_cost": sellable_cost, "sellable_ret": sellable_ret,
+        "warranty_units": warranty_units, "census_units": census_units,
+        "wh_units": wh_units, "office_units": office_units,
         "dc1_po": dc1_po, "kids_po": kids_po,
-        "flows": flows, "ship7": ship7, "recv7": recv7,
-        "flow_avail": flow_avail, "weeks_cover": weeks_cover,
-        "window": (start, end),
+        "flows": flows, "ship30": ship30, "recv30": recv30,
+        "flow_avail": flow_avail, "weeks_cover": weeks_cover, "window": (start, end),
+        "acc_rows": acc_rows,
     }
 
 
+NAVY = "#1E3A5F"
+GREY = "#F4F6F8"
+
+
+def _row(cells, bold=False, top=None, bg=None):
+    style = f"background:{bg};" if bg else ""
+    if top:
+        style += f"border-top:{top};"
+    tds = "".join(
+        f"<td align='{a}' style='padding:6px 9px;{'font-weight:bold;' if bold else ''}{c2}'>{v}</td>"
+        for v, a, c2 in cells)
+    return f"<tr style='{style}'>{tds}</tr>"
+
+
 def render_html(r):
-    dc1_cost, kids_cost = r["dc1"] * DC1_COST, r["kids"] * KIDS_COST
-    dc1_ret, kids_ret = r["dc1"] * DC1_RETAIL, r["kids"] * KIDS_RETAIL
-    tot_cost, tot_ret = dc1_cost + kids_cost, dc1_ret + kids_ret
+    nd, nk = r["new"]; od, ok = r["openbox"]; wd, wk = r["warranty"]
+    sd, sk = r["sellable"]
+
+    core = "".join([
+        f"<tr style='background:{NAVY};color:#fff;'>"
+        f"<th align='left' style='padding:6px 9px;'>Category</th>"
+        f"<th align='right' style='padding:6px 9px;'>DC-1</th>"
+        f"<th align='right' style='padding:6px 9px;'>Kids</th>"
+        f"<th align='right' style='padding:6px 9px;'>Total</th>"
+        f"<th align='right' style='padding:6px 9px;'>Cost</th>"
+        f"<th align='right' style='padding:6px 9px;'>Retail</th></tr>",
+        _row([("New <span style='color:#888;font-size:11px;'>· sellable</span>", "left", ""),
+              (f"{nd:,}", "right", ""), (f"{nk:,}", "right", ""), (f"{nd+nk:,}", "right", "font-weight:bold;"),
+              (usd(r['new_cost']), "right", ""), (usd(r['new_ret']), "right", "")]),
+        _row([("Open-box <span style='color:#888;font-size:11px;'>· B-stock</span>", "left", ""),
+              (f"{od:,}", "right", ""), (f"{ok:,}", "right", ""), (f"{od+ok:,}", "right", "font-weight:bold;"),
+              (usd(r['ob_cost']), "right", ""), (f"<span style='color:#888;'>{usd(r['ob_ret'])}*</span>", "right", "")],
+             bg=GREY),
+        _row([("Warranty <span style='color:#888;font-size:11px;'>· repair</span>", "left", ""),
+              (f"{wd:,}", "right", ""), (f"{wk:,}", "right", ""), (f"{wd+wk:,}", "right", "font-weight:bold;"),
+              ("<span style='color:#888;'>memo</span>", "right", ""), ("<span style='color:#888;'>—</span>", "right", "")]),
+        _row([("Total assembled", "left", ""), (f"{nd+od+wd:,}", "right", ""), (f"{nk+ok+wk:,}", "right", ""),
+              (f"{r['census_units']:,}", "right", ""), ("", "right", ""), ("", "right", "")],
+             bold=True, top=f"2px solid {NAVY}"),
+        _row([("of which sellable", "left", ""), (f"{sd:,}", "right", ""), (f"{sk:,}", "right", ""),
+              (f"{r['sellable_units']:,}", "right", ""), (usd(r['sellable_cost']), "right", ""),
+              (usd(r['sellable_ret']), "right", "")], bold=True, bg=GREY),
+    ])
+
+    # office warranty queue
+    queue = r["office"]["queue"]
+    queue_txt = " · ".join(f"{k} {v}" for k, v in
+                           sorted(queue.items(), key=lambda kv: -kv[1])) if queue else "—"
+    # open-box grades
+    g = r["office"]["grades"]
+    grades_txt = (f"Office: VIP {g.get('VIP',0)} · Sellable {g.get('Sellable',0)} · "
+                  f"Warranty-grade {g.get('Warranty',0)}") if g else ""
+
+    # accessories table
+    acc = "".join(
+        _row([(label, "left", ""),
+              (f"{whq:,}" if whq else "—", "right", ""),
+              (f"{offq:,}" if offq is not None else "—", "right", "")],
+             bg=(GREY if i % 2 else None))
+        for i, (label, whq, offq, _m) in enumerate(r["acc_rows"]))
+
     s, e = r["window"]
     wc = f"{r['weeks_cover']:.1f} weeks" if r["weeks_cover"] else "n/a"
-    flow_rows = (
-        f"<tr><td>Shipped out</td><td align='right'>{r['flows']['ship_dc1']:,}</td>"
-        f"<td align='right'>{r['flows']['ship_kids']:,}</td><td align='right'><b>{r['ship7']:,}</b></td></tr>"
-        f"<tr style='background:#F4F6F8;'><td>Received in</td><td align='right'>{r['flows']['recv_dc1']:,}</td>"
-        f"<td align='right'>{r['flows']['recv_kids']:,}</td><td align='right'><b>{r['recv7']:,}</b></td></tr>"
-        if r["flow_avail"] else
-        "<tr><td colspan='4' style='color:#888;'>No daily shipped/received reports in this window yet "
-        "(DCL began sending them Jun 11 2026).</td></tr>"
-    )
+    flow_line = (f"{r['ship30']:,} shipped · {r['recv30']:,} received "
+                 f"(last 30 days, {s} → {e})") if r["flow_avail"] else \
+        "No daily shipped/received reports populated in this window yet."
+    office_note = "" if r["office_ok"] else \
+        ("<p style='color:#B00;font-size:12px;'>⚠ Office (IMS) sheet could not be read — "
+         "showing warehouse only. Check the service-account share / credentials.</p>")
+
     return f"""
     <div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;font-size:14px;color:#222;max-width:680px;">
       <p style="font-size:11px;letter-spacing:2px;color:#888;text-transform:uppercase;margin-bottom:2px;">
-        Daylight · Inventory Snapshot</p>
-      <p style="margin-top:0;"><b>As of {r['snap_date']}</b> (DCL fulfillment warehouse)</p>
+        Daylight · Internal Inventory (Warehouse + Office)</p>
+      <p style="margin-top:0;"><b>As of {r['snap_date']}</b></p>
+      {office_note}
 
-      <p style="font-size:16px;"><b>{r['total']:,} fully-assembled units on hand</b>
-         &nbsp;·&nbsp; {usd(tot_cost)} at cost &nbsp;·&nbsp; {usd(tot_ret)} at retail</p>
+      <p style="font-size:16px;margin:6px 0;">
+        <b>{r['census_units']:,} fully-assembled DC-1 units on hand</b>
+        &nbsp;·&nbsp; {r['wh_units']:,} warehouse + {r['office_units']:,} office</p>
+      <p style="font-size:14px;margin:0 0 10px;color:#333;">
+        Sellable: <b>{r['sellable_units']:,}</b> &nbsp;·&nbsp; {usd(r['sellable_cost'])} at cost
+        &nbsp;·&nbsp; {usd(r['sellable_ret'])} at retail
+        &nbsp;·&nbsp; <span style="color:#777;">{r['warranty_units']:,} warranty (memo)</span></p>
 
-      <table cellpadding="7" cellspacing="0" style="border-collapse:collapse;font-size:13.5px;margin:10px 0;">
-        <tr style="background:#1E3A5F;color:#fff;"><th align="left">Product</th>
-          <th align="right">Units</th><th align="right">Cost value</th><th align="right">Retail value</th></tr>
-        <tr><td>Daylight DC‑1</td><td align="right">{r['dc1']:,}</td>
-            <td align="right">{usd(dc1_cost)}</td><td align="right">{usd(dc1_ret)}</td></tr>
-        <tr style="background:#F4F6F8;"><td>Daylight Kids DC‑1</td><td align="right">{r['kids']:,}</td>
-            <td align="right">{usd(kids_cost)}</td><td align="right">{usd(kids_ret)}</td></tr>
-        <tr style="border-top:2px solid #1E3A5F;"><td><b>Total (new, sellable)</b></td>
-            <td align="right"><b>{r['total']:,}</b></td><td align="right"><b>{usd(tot_cost)}</b></td>
-            <td align="right"><b>{usd(tot_ret)}</b></td></tr>
-        <tr style="color:#666;"><td>Open-box / returns (refurb)</td><td align="right">{r['openbox']:,}</td>
-            <td align="right" colspan="2">valued separately</td></tr>
+      <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13.5px;margin:10px 0;width:100%;">
+        {core}
+      </table>
+      <p style="font-size:11.5px;color:#888;margin:2px 0 16px;">
+        *open-box retail at list; B-stock sells at a discount. Warranty units shown as a memo
+        (carried at NRV, not full cost). Sellable = new + open-box.</p>
+
+      <p style="font-size:13.5px;margin:14px 0 4px;"><b>Open-box grades</b> ({od+ok:,})</p>
+      <p style="font-size:13px;color:#444;margin:0 0 12px;">
+        Warehouse: graded returns (4-x). {grades_txt}</p>
+
+      <p style="font-size:13.5px;margin:14px 0 4px;"><b>Office warranty queue</b> ({wd+wk:,} awaiting repair)</p>
+      <p style="font-size:13px;color:#444;margin:0 0 12px;">{queue_txt}</p>
+
+      <p style="font-size:13.5px;margin:14px 0 4px;"><b>Accessories &amp; peripherals</b>
+        <span style="color:#888;font-size:11px;">(not counted as devices)</span></p>
+      <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;margin:2px 0 12px;width:100%;">
+        <tr style="background:{NAVY};color:#fff;"><th align="left" style="padding:5px 9px;">Item</th>
+          <th align="right" style="padding:5px 9px;">Warehouse</th><th align="right" style="padding:5px 9px;">Office</th></tr>
+        {acc}
       </table>
 
-      <table cellpadding="7" cellspacing="0" style="border-collapse:collapse;font-size:13.5px;margin:10px 0;">
-        <tr style="background:#1E3A5F;color:#fff;"><th align="left">Last 7 days ({s} → {e})</th>
-          <th align="right">DC‑1</th><th align="right">Kids</th><th align="right">Total</th></tr>
-        {flow_rows}
-      </table>
+      <p style="font-size:13.5px;margin:14px 0 4px;"><b>Flow &amp; cover</b></p>
+      <p style="font-size:13px;color:#444;margin:0;">
+        Inbound (open POs): {r['dc1_po']:,} DC-1 · {r['kids_po']:,} Kids on order.<br>
+        {flow_line}<br>
+        Weeks of cover: {wc} (sellable ÷ weekly ship rate).</p>
 
-      <p style="font-size:13.5px;">
-        <b>Inbound (open POs):</b> {r['dc1_po']:,} DC‑1 · {r['kids_po']:,} Kids on order arriving.<br>
-        <b>Weeks of cover:</b> {wc} (on-hand ÷ last-week ship rate).
-      </p>
-
-      <p style="font-size:12px;color:#777;">
-        New finished sellable units only (DC‑1 + Kids); excludes accessories, components, open-box
-        (shown separately), and office stock. Cost = production cost per unit (${DC1_COST:,.0f} DC‑1;
-        Kids ${KIDS_COST:,.0f} <i>placeholder — pending confirmation</i>). Retail = list price
-        (${DC1_RETAIL:,.0f} DC‑1 / ${KIDS_RETAIL:,.0f} Kids). Source: DCL "Items Status" {r['snap_date']} (attached).
-      </p>
-      <p style="font-size:12px;color:#777;">— Automated weekly inventory snapshot.</p>
+      <p style="font-size:12px;color:#777;margin-top:16px;">
+        Cost = production cost (${DC1_COST:,.0f} DC-1 · Kids ${KIDS_COST:,.0f}, bundle).
+        Retail = list (${DC1_RETAIL:,.0f} DC-1 / ${KIDS_RETAIL:,.0f} Kids).
+        Warehouse = DCL "Items Status" {r['snap_date']} (attached); Office = Daylight IMS sheet (live).</p>
+      <p style="font-size:12px;color:#777;">— Automated monthly internal inventory report.</p>
     </div>
     """
 
@@ -246,12 +384,16 @@ def send(r):
     if not to_list:
         raise SystemExit("No INTERNAL_RECIPIENTS / REPORT_RECIPIENT set.")
     msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Inventory Snapshot — {r['total']:,} units on hand (as of {r['snap_date']})"
+    msg["Subject"] = (f"Inventory (internal) — {r['census_units']:,} units "
+                      f"({r['wh_units']:,} wh / {r['office_units']:,} office), as of {r['snap_date']}")
     msg["From"] = SMTP_USERNAME
     msg["To"] = ", ".join(to_list)
     alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(f"Inventory snapshot as of {r['snap_date']}: {r['total']:,} units on hand "
-                        f"(DC-1 {r['dc1']:,} + Kids {r['kids']:,}).", "plain"))
+    nd, nk = r["new"]
+    alt.attach(MIMEText(
+        f"Internal inventory as of {r['snap_date']}: {r['census_units']:,} fully-assembled units "
+        f"({r['wh_units']:,} warehouse + {r['office_units']:,} office); {r['sellable_units']:,} sellable, "
+        f"{usd(r['sellable_cost'])} at cost.", "plain"))
     alt.attach(MIMEText(html, "html"))
     msg.attach(alt)
     part = MIMEApplication(r["payload"], Name=r["fname"])
@@ -263,7 +405,7 @@ def send(r):
     else:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as srv:
             srv.starttls(); srv.login(SMTP_USERNAME, SMTP_PASSWORD); srv.send_message(msg)
-    print(f"Sent internal snapshot to {to_list}")
+    print(f"Sent internal report to {to_list}")
 
 
 def main():
@@ -272,6 +414,7 @@ def main():
     ap.add_argument("--monthly", action="store_true",
                     help="monthly cadence: only send on the day the first new-month "
                          "snapshot arrives (so a daily 1st-7th cron fires once)")
+    ap.add_argument("--html-out", metavar="PATH", help="write rendered HTML to a file (debug)")
     args = ap.parse_args()
     r = build_report()
 
@@ -281,9 +424,15 @@ def main():
             print(f"--monthly: snapshot {r['snap_date']} != today {today} (or past day 7) "
                   f"- exiting quietly.")
             return
-    print(f"As of {r['snap_date']}: DC-1 {r['dc1']}, Kids {r['kids']}, total {r['total']}, "
-          f"open-box {r['openbox']}, inbound POs DC1 {r['dc1_po']}/Kids {r['kids_po']}, "
-          f"7d shipped {r['ship7']} / received {r['recv7']}")
+    nd, nk = r["new"]
+    print(f"As of {r['snap_date']}: census {r['census_units']} "
+          f"(wh {r['wh_units']} / office {r['office_units']}), sellable {r['sellable_units']} "
+          f"= {usd(r['sellable_cost'])} cost / {usd(r['sellable_ret'])} retail; "
+          f"warranty {r['warranty_units']} memo; office_ok={r['office_ok']}")
+    if args.html_out:
+        with open(args.html_out, "w") as f:
+            f.write(render_html(r))
+        print(f"Wrote HTML to {args.html_out}")
     if args.dry_run:
         print("Dry run — not sending."); return
     send(r)

@@ -20,3 +20,6 @@ out/
 
 # Monthly history snapshots
 data/*/month_*.json
+
+# Google service-account creds (never commit)
+credentials/
