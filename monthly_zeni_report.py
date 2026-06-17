@@ -16,9 +16,10 @@ Today" flow reports each evening. This script:
   2. If the snapshot is later than the 1st, walks it BACK to the exact
      month-end using the daily flow reports: month-end = snapshot
      + units shipped in between - units received in between.
-  3. Counts finished units: DC-1 family (SKUs 1, 6, 6-k) + Kids (SKU 7),
-     valued at retail price per product (DC1_VALUE_USD, default $729;
-     KIDS_VALUE_USD, default $799).
+  3. Combines warehouse new + open-box with the office sheet (via
+     inventory_core, shared with the internal report) and values them on
+     Zeni's basis: New + Open-box at cost (shown at retail too), Warranty
+     as a count-only memo.
   4. Emails Zeni a short summary with the source CSV attached.
 
 Scheduling: the GitHub Actions workflow runs daily on the 1st-7th of each
@@ -44,6 +45,9 @@ import pandas as pd
 from imap_tools import MailBox, AND
 from dotenv import load_dotenv
 
+import inventory_core as core
+import office_inventory
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 
 IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
@@ -63,52 +67,18 @@ ZENI_RECIPIENTS = os.getenv("ZENI_RECIPIENTS", "")
 ZENI_CC = os.getenv("ZENI_CC", "")
 REPORT_RECIPIENT = os.getenv("REPORT_RECIPIENT")  # fallback / preview
 
-# What counts as a fully assembled, sellable unit.
-# SKU 1 = Daylight DC-1, 6 / 6-k = POS units (usually zero), 7 = Kids DC-1.
-# Open-box/returned units (4-x-x), bundles (N-type virtual SKUs) and
-# accessories are excluded.
-DC1_SKUS = {"1", "6", "6-k"}
-KIDS_SKUS = {"7"}
-
-# Valuation per unit. Zeni asked for BOTH cost value and retail value.
-#  - Retail = list price.        Override: DC1_VALUE_USD / KIDS_VALUE_USD
-#  - Cost   = production cost.   Override: DC1_COST_USD / KIDS_COST_USD
-# DC-1 cost ($425) is Anjan's production-cost figure from May 2026 ("what
-# DCL books inventory at"). Kids cost is a placeholder (Kids is a bundle,
-# not separately costed yet) - pending Anjan's confirmation.
-def _envfloat(name, default):
-    """float() of an env var, tolerant of unset/empty (GitHub passes an
-    undefined secret as an empty string, which would crash float('')."""
-    v = (os.getenv(name) or "").strip()
-    try:
-        return float(v) if v else float(default)
-    except ValueError:
-        return float(default)
-
-
-DC1_VALUE = _envfloat("DC1_VALUE_USD", 729)
-KIDS_VALUE = _envfloat("KIDS_VALUE_USD", 799)
-DC1_COST = _envfloat("DC1_COST_USD", 425)
-KIDS_COST = _envfloat("KIDS_COST_USD", 425)
-# Set to "1" once Anjan has confirmed the cost figures; until then the
-# report watermarks the cost column as provisional.
+# SKU sets and per-unit money live in inventory_core, shared with the internal
+# (Anjan) report so the two can never disagree. Valuation basis confirmed by
+# Zeni (Amol Taxali, 2026-06-17): New + Open-box valued at cost (shown at retail
+# too); Warranty units are a count-only memo (carried at NRV, not full cost).
+DC1_SKUS = core.DC1_SKUS
+KIDS_SKUS = core.KIDS_SKUS
+DC1_VALUE, KIDS_VALUE = core.DC1_RETAIL, core.KIDS_RETAIL   # retail list price
+DC1_COST, KIDS_COST = core.DC1_COST, core.KIDS_COST          # production cost
+norm_items = core.norm_items
+date_from_filename = core.date_from_filename
+# Set to "1" once cost is confirmed; until then cost stays a [PREVIEW] to us.
 COST_CONFIRMED = os.getenv("COST_CONFIRMED", "0") == "1"
-
-
-import re
-from datetime import datetime
-
-
-def date_from_filename(filename, fallback):
-    """DCL files embed the report date, e.g. 'Items Status-2026-06-01_0000.csv'.
-    Use that (timezone-proof) rather than the email's received timestamp."""
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", filename or "")
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-        except ValueError:
-            pass
-    return fallback
 
 
 def fetch_snapshots(limit=10):
@@ -147,27 +117,6 @@ def pick_snapshot(snaps, month_end):
     if before:
         return before[-1], True
     return None, False
-
-
-def norm_items(series):
-    """Normalize the Item # column to clean strings.
-
-    Critical: if a snapshot CSV contains any blank/NaN Item # cell (a trailing
-    blank row, a summary row, etc.) pandas types the whole column float64, and
-    a plain .astype(str) turns SKU '1' into '1.0' - which matches NONE of our
-    SKU sets and silently collapses every count to 0. Stripping a trailing
-    '.0' makes the match robust regardless of inferred dtype.
-    """
-    return series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-
-
-def count_units(df):
-    """Count finished units in a snapshot dataframe."""
-    items = norm_items(df["Item #"])
-    qty = pd.to_numeric(df["Q On Hand"], errors="coerce").fillna(0)
-    dc1 = int(qty[items.isin(DC1_SKUS)].sum())
-    kids = int(qty[items.isin(KIDS_SKUS)].sum())
-    return dc1, kids
 
 
 def _sum_finished(df, qty_col):
@@ -294,7 +243,8 @@ def main():
             print("Not send day (snapshot didn't arrive today) - exiting quietly.")
             return
 
-    dc1, kids = count_units(df)
+    wh = core.warehouse_breakdown(df)
+    dc1, kids = wh["new_dc1"], wh["new_kids"]   # new units; walked back below
 
     # A snapshot dated S (taken 00:01) reflects the close of S-1. If the
     # snapshot is later than month_end+1, walk it back to the exact close
@@ -332,13 +282,25 @@ def main():
             )
             print(f"Daily flows {reason} ({have_ship}/{n_days} shipped, {have_recv}/{n_days} received) - using snapshot as-is.")
 
-    total = dc1 + kids
-    dc1_ret, kids_ret = dc1 * DC1_VALUE, kids * KIDS_VALUE
-    dc1_cost, kids_cost = dc1 * DC1_COST, kids * KIDS_COST
-    total_ret = dc1_ret + kids_ret
-    total_cost = dc1_cost + kids_cost
-    print(f"Fully assembled units: {total} (DC-1 {dc1} + Kids {kids}) ~ "
-          f"${total_cost:,.0f} cost / ${total_ret:,.0f} retail")
+    # Merge the (possibly walked-back) warehouse new units with warehouse
+    # open-box and the office sheet, then value on Zeni's basis: New + Open-box
+    # at cost (+ retail), Warranty as a count-only memo.
+    wh["new_dc1"], wh["new_kids"] = dc1, kids
+    office = office_inventory.office_summary()
+    office_ok = office is not None
+    if not office_ok:
+        office = core.empty_office()
+    data = core.combine(wh, office)
+
+    new_d, new_k = data["new"]
+    ob_d, ob_k = data["openbox"]
+    sell_units = data["sellable_units"]
+    sell_cost, sell_ret = data["sellable_cost"], data["sellable_ret"]
+    warranty_units = data["warranty_units"]
+    print(f"Sellable (new+open-box): {sell_units} "
+          f"(new {new_d + new_k} + open-box {ob_d + ob_k}) ~ "
+          f"${sell_cost:,.0f} cost / ${sell_ret:,.0f} retail; "
+          f"warranty memo {warranty_units}; office_ok={office_ok}")
 
     if args.dry_run:
         print("Dry run - not sending.")
@@ -370,58 +332,68 @@ def main():
         f"by {(month_end - snap_date).days} day(s); no later report was available.</p>"
         if stale else ""
     )
+    sell_d, sell_k = data["sellable"]
+    new_units, ob_units = new_d + new_k, ob_d + ob_k
+    new_cost, new_ret = data["new_cost"], data["new_ret"]
+    ob_cost, ob_ret = data["ob_cost"], data["ob_ret"]
+    cost_prov = "" if COST_CONFIRMED else " — provisional, pending confirmation"
     html = f"""
     <div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;
-                font-size:14px;color:#222;max-width:560px;">
-      <p>Hi Zeni team,</p>
-      <p>Fully assembled, ready-to-sell units on hand at our fulfillment
-         warehouse (DCL) for the <b>{month_label}</b> close:</p>
+                font-size:14px;color:#222;max-width:620px;">
+      <p>Hi Amol,</p>
+      <p>Fully assembled units (DC-1 + Kids) on hand for the <b>{month_label}</b>
+         close, per your note — New and Open-box valued at cost, Warranty as a
+         count-only memo:</p>
       <table cellpadding="8" cellspacing="0"
-             style="border-collapse:collapse;font-size:14px;margin:12px 0;">
+             style="border-collapse:collapse;font-size:13.5px;margin:12px 0;">
         <tr style="background:#1E3A5F;color:#fff;">
-          <th align="left">Product</th><th align="right">Units</th>
+          <th align="left">Category</th><th align="right">DC-1</th>
+          <th align="right">Kids</th><th align="right">Units</th>
           <th align="right">Cost value</th><th align="right">Retail value</th></tr>
-        <tr><td>Daylight DC-1</td><td align="right">{dc1:,}</td>
-            <td align="right">${dc1_cost:,.0f}</td><td align="right">${dc1_ret:,.0f}</td></tr>
-        <tr style="background:#F4F6F8;"><td>Daylight Kids DC-1</td>
-            <td align="right">{kids:,}</td>
-            <td align="right">${kids_cost:,.0f}</td><td align="right">${kids_ret:,.0f}</td></tr>
-        <tr style="border-top:2px solid #1E3A5F;"><td><b>Total</b></td>
-            <td align="right"><b>{total:,}</b></td>
-            <td align="right"><b>${total_cost:,.0f}</b></td>
-            <td align="right"><b>${total_ret:,.0f}</b></td></tr>
+        <tr><td>New (sellable)</td><td align="right">{new_d:,}</td>
+            <td align="right">{new_k:,}</td><td align="right">{new_units:,}</td>
+            <td align="right">${new_cost:,.0f}</td><td align="right">${new_ret:,.0f}</td></tr>
+        <tr style="background:#F4F6F8;"><td>Open-box (graded returns)</td>
+            <td align="right">{ob_d:,}</td><td align="right">{ob_k:,}</td>
+            <td align="right">{ob_units:,}</td>
+            <td align="right">${ob_cost:,.0f}</td>
+            <td align="right" style="color:#777;">${ob_ret:,.0f}*</td></tr>
+        <tr style="border-top:2px solid #1E3A5F;"><td><b>Total (New + Open-box)</b></td>
+            <td align="right"><b>{sell_d:,}</b></td><td align="right"><b>{sell_k:,}</b></td>
+            <td align="right"><b>{sell_units:,}</b></td>
+            <td align="right"><b>${sell_cost:,.0f}</b></td>
+            <td align="right"><b>${sell_ret:,.0f}</b></td></tr>
       </table>
+      <p style="font-size:13px;color:#555;margin:6px 0;">
+        <b>Warranty (memo):</b> {warranty_units:,} units awaiting repair — held at
+        net realizable value, not included in the totals above.</p>
       <p style="font-size:12.5px;color:#555;">
-        Source: DCL "Items Status" inventory report dated {snap_date}
-        (attached). {adj_note} Counts new finished devices only - excludes
-        open-box returns, accessories, components, and any units held at
-        our office.<br>
-        <b>Cost value</b> = units &times; production cost (${DC1_COST:,.0f}
-        per DC-1{'' if COST_CONFIRMED else ' — provisional, pending finance confirmation'};
-        Kids ${KIDS_COST:,.0f}{'' if COST_CONFIRMED else ' placeholder'}).
-        <b>Retail value</b> = units &times; list price (${DC1_VALUE:,.0f}
-        per DC-1, ${KIDS_VALUE:,.0f} per Kids DC-1).
-      </p>
+        Units are DC-1 + Kids combined (split in the table). Open-box is carried
+        at full production cost per your basis; the *asterisk notes that open-box
+        <i>retail</i> is shown at list, though B-stock typically sells at a discount.<br>
+        <b>Cost</b> = production cost (${DC1_COST:,.0f}/unit, both models{cost_prov}).
+        <b>Retail</b> = list price (${DC1_VALUE:,.0f} DC-1, ${KIDS_VALUE:,.0f} Kids).<br>
+        Source: DCL warehouse snapshot dated {snap_date} (as of the {month_label}
+        close, attached); office stock is as of the report date. {adj_note}</p>
       {stale_note}
-      <p>This report is generated automatically on the first DCL inventory
-         snapshot after each month-end. Reply to this email with any
+      <p>This is generated automatically after each month-end. Reply with any
          questions and the team will follow up.</p>
       <p>- Daylight Computer (automated report)</p>
     </div>
     """
     text = (
-        f"Fully assembled units on hand at DCL - {month_label} close\n\n"
-        f"  {'Product':<20}{'Units':>7}{'Cost value':>14}{'Retail value':>15}\n"
-        f"  {'Daylight DC-1':<20}{dc1:>7,}{'$'+format(dc1_cost,',.0f'):>14}{'$'+format(dc1_ret,',.0f'):>15}\n"
-        f"  {'Daylight Kids DC-1':<20}{kids:>7,}{'$'+format(kids_cost,',.0f'):>14}{'$'+format(kids_ret,',.0f'):>15}\n"
-        f"  {'TOTAL':<20}{total:>7,}{'$'+format(total_cost,',.0f'):>14}{'$'+format(total_ret,',.0f'):>15}\n\n"
-        f"Source: DCL Items Status report dated {snap_date} (attached). {adj_note}\n"
-        f"New finished devices only - excludes open-box returns, accessories,\n"
-        f"components, and office units.\n"
-        f"Cost value = units x production cost (${DC1_COST:,.0f} DC-1"
-        f"{'' if COST_CONFIRMED else ' provisional'}; Kids ${KIDS_COST:,.0f}"
-        f"{'' if COST_CONFIRMED else ' placeholder'}).\n"
-        f"Retail value = units x list price (${DC1_VALUE:,.0f} DC-1, ${KIDS_VALUE:,.0f} Kids)."
+        f"Fully assembled inventory (DC-1 + Kids) - {month_label} close "
+        f"(New + Open-box at cost; Warranty memo)\n\n"
+        f"  {'Category':<26}{'Units':>7}{'Cost value':>14}{'Retail value':>15}\n"
+        f"  {'New (sellable)':<26}{new_units:>7,}{'$'+format(new_cost,',.0f'):>14}{'$'+format(new_ret,',.0f'):>15}\n"
+        f"  {'Open-box (returns)':<26}{ob_units:>7,}{'$'+format(ob_cost,',.0f'):>14}{'$'+format(ob_ret,',.0f'):>15}\n"
+        f"  {'TOTAL (New+Open-box)':<26}{sell_units:>7,}{'$'+format(sell_cost,',.0f'):>14}{'$'+format(sell_ret,',.0f'):>15}\n\n"
+        f"Warranty (memo): {warranty_units:,} units awaiting repair, held at NRV, not in totals.\n\n"
+        f"Cost = production cost (${DC1_COST:,.0f}/unit both models{' provisional' if not COST_CONFIRMED else ''}); "
+        f"open-box carried at full cost per your basis.\n"
+        f"Retail = list price (${DC1_VALUE:,.0f} DC-1, ${KIDS_VALUE:,.0f} Kids); open-box retail at list.\n"
+        f"Source: DCL warehouse snapshot {snap_date} (as of {month_label} close, attached); "
+        f"office stock as of report date. {adj_note}"
     )
 
     send_email(subject, html, text, to_list, cc_list, (fname, payload))

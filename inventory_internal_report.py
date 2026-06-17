@@ -7,8 +7,9 @@ new / open-box / warranty by model and location, cost + retail valuation,
 open-box grades, the office warranty-repair queue, accessories, inbound POs,
 trailing flow and weeks-of-cover. Deterministic, no LLM.
 
-Zeni's report (monthly_zeni_report.py) is intentionally warehouse-only; this
-internal one is the superset.
+Both reports combine warehouse + office on the same valuation basis (via
+inventory_core); this internal one adds the operational detail (open-box
+grades, warranty queue, accessories, flow) on top.
 
 Sources:
   - DCL "Items Status"  on-hand snapshot (warehouse)            [email]
@@ -31,6 +32,7 @@ import pandas as pd
 from imap_tools import MailBox, AND
 from dotenv import load_dotenv
 
+import inventory_core as core
 import office_inventory
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
@@ -46,24 +48,14 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 # Internal report goes to Jesse (he forwards to Anjan). Override via INTERNAL_RECIPIENTS.
 INTERNAL_RECIPIENTS = (os.getenv("INTERNAL_RECIPIENTS") or os.getenv("REPORT_RECIPIENT") or "")
 
-DC1_SKUS = {"1", "6", "6-k"}
-KIDS_SKUS = {"7"}
-
-
-def _envfloat(name, default):
-    """float() tolerant of unset/empty env (GitHub passes undefined secrets as '')."""
-    v = (os.getenv(name) or "").strip()
-    try:
-        return float(v) if v else float(default)
-    except ValueError:
-        return float(default)
-
-
-# Retail (list) price and production cost per unit. Env-overridable.
-DC1_RETAIL = _envfloat("DC1_VALUE_USD", 729)
-KIDS_RETAIL = _envfloat("KIDS_VALUE_USD", 799)
-DC1_COST = _envfloat("DC1_COST_USD", 425)     # Anjan, May 2026 (production cost)
-KIDS_COST = _envfloat("KIDS_COST_USD", 425)   # Kids bundle, same per-unit per Jesse 2026-06-16
+# SKU sets, per-unit money, and the warehouse+office combine all live in
+# inventory_core so this report and the Zeni report can never disagree.
+DC1_SKUS = core.DC1_SKUS
+KIDS_SKUS = core.KIDS_SKUS
+DC1_COST, KIDS_COST = core.DC1_COST, core.KIDS_COST
+DC1_RETAIL, KIDS_RETAIL = core.DC1_RETAIL, core.KIDS_RETAIL
+norm_items = core.norm_items
+date_from_filename = core.date_from_filename
 
 # Accessory alignment: office sheet label -> warehouse SKU(s) to sum on-hand.
 WH_ACC = {
@@ -84,24 +76,6 @@ WH_ACC = {
 # Warehouse-only accessories worth surfacing (no office row).
 EXTRA_WH_ACC = [("Kids Stylus", ["30"]), ("Keyboard Case", ["32"]),
                 ("Logitech keyboard", ["35-"]), ("Kids Night Light", ["38-"])]
-
-
-def date_from_filename(filename, fallback):
-    """DCL files embed the report date (timezone-proof) e.g. 'Items Status-2026-06-01_0000.csv'."""
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", filename or "")
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-        except ValueError:
-            pass
-    return fallback
-
-
-def norm_items(series):
-    """Clean Item # to strings, robust to pandas inferring the column as float
-    (a blank/summary row turns '1' into '1.0', which would match no SKU and
-    silently zero every count). Strip a trailing '.0' to be safe."""
-    return series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
 
 
 def _read_attachment(att):
@@ -166,12 +140,6 @@ def usd(x):
     return f"${x:,.0f}"
 
 
-def _empty_office():
-    z = {"total": 0, "std": 0, "kids": 0}
-    return {"new": dict(z), "warranty": dict(z), "openbox": dict(z), "total": dict(z),
-            "grades": {}, "queue": {}, "accessories": {}}
-
-
 def build_report():
     snap = latest_status()
     if not snap:
@@ -186,48 +154,20 @@ def build_report():
     def wh_qty(skus):
         return int(sum(oh_by_item.get(s, 0) for s in skus))
 
-    # --- warehouse finished goods ---
-    wh_new_dc1 = int(oh[df["Item #"].isin(DC1_SKUS)].sum())
-    wh_new_kids = int(oh[df["Item #"].isin(KIDS_SKUS)].sum())
-    wh_openbox = int(oh[df["Item #"].str.startswith("4-") | (df["Item #"] == "2")].sum())  # all DC-1
-
     dc1_po = int(po[df["Item #"].isin(DC1_SKUS)].sum())
     kids_po = int(po[df["Item #"].isin(KIDS_SKUS)].sum())
 
-    # --- office (Daylight IMS) ---
+    # --- shared warehouse + office combine (same math the Zeni report uses) ---
     office = office_inventory.office_summary()
     office_ok = office is not None
     if not office_ok:
-        office = _empty_office()
-
-    # --- combined category x model ---
-    new_dc1 = wh_new_dc1 + office["new"]["std"]
-    new_kids = wh_new_kids + office["new"]["kids"]
-    ob_dc1 = wh_openbox + office["openbox"]["std"]     # warehouse open-box is all DC-1
-    ob_kids = office["openbox"]["kids"]
-    wr_dc1 = office["warranty"]["std"]                 # warehouse warranty folded in open-box
-    wr_kids = office["warranty"]["kids"]
-
-    sellable_dc1, sellable_kids = new_dc1 + ob_dc1, new_kids + ob_kids
-    sellable_units = sellable_dc1 + sellable_kids
-    warranty_units = wr_dc1 + wr_kids
-    census_units = sellable_units + warranty_units
-
-    new_cost = new_dc1 * DC1_COST + new_kids * KIDS_COST
-    new_ret = new_dc1 * DC1_RETAIL + new_kids * KIDS_RETAIL
-    ob_cost = ob_dc1 * DC1_COST + ob_kids * KIDS_COST
-    ob_ret = ob_dc1 * DC1_RETAIL + ob_kids * KIDS_RETAIL
-    sellable_cost = new_cost + ob_cost
-    sellable_ret = new_ret + ob_ret
-
-    wh_units = wh_new_dc1 + wh_new_kids + wh_openbox
-    office_units = office["total"]["total"]
+        office = core.empty_office()
+    data = core.combine(core.warehouse_breakdown(df), office)
 
     # --- accessories: warehouse vs office, aligned ---
     acc_rows = []
     for label, val in office["accessories"].items():
-        acc_rows.append((label, wh_qty(WH_ACC.get(label, [])), val,
-                         label in WH_ACC))
+        acc_rows.append((label, wh_qty(WH_ACC.get(label, [])), val, label in WH_ACC))
     for label, skus in EXTRA_WH_ACC:
         acc_rows.append((label, wh_qty(skus), None, True))
 
@@ -238,17 +178,12 @@ def build_report():
     ship30 = flows["ship_dc1"] + flows["ship_kids"]
     recv30 = flows["recv_dc1"] + flows["recv_kids"]
     flow_avail = bool(flows["ship_days"] or flows["recv_days"])
-    weeks_cover = (sellable_units / (ship30 / 4.3)) if ship30 > 0 else None
+    weeks_cover = (data["sellable_units"] / (ship30 / 4.3)) if ship30 > 0 else None
 
     return {
+        **data,
         "snap_date": snap_date, "fname": fname, "payload": payload,
         "office_ok": office_ok, "office": office,
-        "new": (new_dc1, new_kids), "openbox": (ob_dc1, ob_kids), "warranty": (wr_dc1, wr_kids),
-        "new_cost": new_cost, "new_ret": new_ret, "ob_cost": ob_cost, "ob_ret": ob_ret,
-        "sellable": (sellable_dc1, sellable_kids), "sellable_units": sellable_units,
-        "sellable_cost": sellable_cost, "sellable_ret": sellable_ret,
-        "warranty_units": warranty_units, "census_units": census_units,
-        "wh_units": wh_units, "office_units": office_units,
         "dc1_po": dc1_po, "kids_po": kids_po,
         "flows": flows, "ship30": ship30, "recv30": recv30,
         "flow_avail": flow_avail, "weeks_cover": weeks_cover, "window": (start, end),
@@ -334,7 +269,7 @@ def render_html(r):
       {office_note}
 
       <p style="font-size:16px;margin:6px 0;">
-        <b>{r['census_units']:,} fully-assembled DC-1 units on hand</b>
+        <b>{r['census_units']:,} fully-assembled units on hand (DC-1 + Kids)</b>
         &nbsp;·&nbsp; {r['wh_units']:,} warehouse + {r['office_units']:,} office</p>
       <p style="font-size:14px;margin:0 0 10px;color:#333;">
         Sellable: <b>{r['sellable_units']:,}</b> &nbsp;·&nbsp; {usd(r['sellable_cost'])} at cost
